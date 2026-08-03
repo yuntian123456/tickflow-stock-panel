@@ -52,11 +52,19 @@ jobs:
             fi
           fi
 
-      # 3. 获取 main 分支最新 commit 的 Short SHA 用于 Docker 镜像 Tag
-      - name: Get Short SHA
+      # 3. 读取根目录 VERSION 文件内容用于 Docker 镜像 Tag
+      - name: Get Version
         if: env.has_updates == 'true'
         id: vars
-        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+        run: |
+          # 读取根目录 VERSION 文件并过滤换行符与空格
+          if [ -f "VERSION" ] && [ -s "VERSION" ]; then
+            APP_VER=$(cat VERSION | tr -d '\r\n ')
+          else
+            APP_VER="latest"
+          fi
+          echo "app_version=${APP_VER}" >> $GITHUB_OUTPUT
+          echo "读取到的项目版本号为: ${APP_VER}"
 
       # 4. 配置 Docker 构建环境
       - name: Set up QEMU
@@ -84,12 +92,13 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64
           push: true
-          # 关键修改：开启 stock-sdk，同时禁用国内镜像源（避免 Actions 海外节点连接国内超时）
+          # 开启 stock-sdk，并禁用国内镜像源（避免海外 Runner 访问国内源超时）
           build-args: |
             INCLUDE_STOCKSDK=1
             USE_CN_MIRROR=0
+          # 仅推送两个标签：latest 以及来自 VERSION 文件的版本号（如 1.2.0）
           tags: |
             ${{ secrets.DOCKER_USERNAME }}/tickflow-stock-panel:latest
-            ${{ secrets.DOCKER_USERNAME }}/tickflow-stock-panel:${{ steps.vars.outputs.sha_short }}
+            ${{ secrets.DOCKER_USERNAME }}/tickflow-stock-panel:${{ steps.vars.outputs.app_version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
