@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import sys
 import types
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import polars as pl
 import pytest
 
 from app.data_providers.custom import loader as cs_loader
@@ -191,6 +192,26 @@ def test_get_minute_period_mapping(fake_eltdx, freq, expected):
     df = provider.get_minute(["000001.SZ"], None, None, freq=freq)
     assert period_log == [expected]
     assert df.columns == ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
+    assert df["datetime"].to_list() == [datetime(2026, 1, 2, 9, 31)]
+
+
+def test_get_minute_aware_datetime_normalized(fake_eltdx):
+    """eltdx 返回 UTC 带时区时间戳: 去时区为 naive 墙钟, 与 naive start/end_time 过滤不冲突。"""
+    series = SimpleNamespace(
+        bars=[
+            _bar(datetime(2026, 1, 2, 9, 31, tzinfo=timezone.utc), close=10.0),
+            _bar(datetime(2026, 1, 2, 14, 30, tzinfo=timezone.utc), close=10.5),
+        ]
+    )
+    fake_eltdx(FakeTdxClient(series=series))
+    provider = EltdxProvider()
+    df = provider.get_minute(
+        ["000001.SZ"],
+        datetime(2026, 1, 2, 9, 31),
+        datetime(2026, 1, 2, 10, 0),
+        freq="1m",
+    )
+    assert df["datetime"].dtype == pl.Datetime("us")  # naive, 无时区
     assert df["datetime"].to_list() == [datetime(2026, 1, 2, 9, 31)]
 
 

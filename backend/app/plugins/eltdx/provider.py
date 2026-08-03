@@ -63,11 +63,18 @@ def _to_symbol(full_code: str) -> str:
     return f"{code}.{_TDX_TO_EXCHANGE.get(ex, 'SZ')}"
 
 
+def _naive(t) -> "datetime":
+    """去掉时区保留墙钟时间: eltdx 返回 UTC 带时区 datetime, 而项目内
+    start_time/end_time 均为无时区(naive)北京时间, 两者直接比较会因
+    dtype 不一致报错。通达信协议的时间本就是交易所本地墙钟, 去 tz 后口径对齐。"""
+    return t.replace(tzinfo=None) if t.tzinfo is not None else t
+
+
 def _bar_to_daily_row(bar, symbol: str) -> dict:
     """eltdx KlineBar → 内部日K行(不含 datetime, 避免与 date 冲突)。"""
     return {
         "symbol": symbol,
-        "date": bar.time.date(),
+        "date": _naive(bar.time).date(),
         "open": bar.open,
         "high": bar.high,
         "low": bar.low,
@@ -81,7 +88,7 @@ def _bar_to_minute_row(bar, symbol: str) -> dict:
     """eltdx KlineBar → 内部分钟K行。"""
     return {
         "symbol": symbol,
-        "datetime": bar.time,
+        "datetime": _naive(bar.time),
         "open": bar.open,
         "high": bar.high,
         "low": bar.low,
