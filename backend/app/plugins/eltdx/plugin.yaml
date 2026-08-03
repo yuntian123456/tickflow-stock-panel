@@ -1,0 +1,13 @@
+# eltdx 内置可选数据源插件
+# ⚠️ 合规提示: 本插件通过 eltdx 接入通达信行情协议(7709), 行情数据未获授权, 仅限个人学习研究。
+#    不保证数据完整性与时效性。Docker 默认不打包; 启用即视为使用者知悉并自行承担合规责任。
+#    开发模式下需手动安装依赖: cd backend && pip install eltdx
+
+name: eltdx
+display_name: "通达信行情（eltdx）"
+runtime: python
+entry: app.plugins.eltdx.provider:EltdxProvider
+check: app.plugins.eltdx.bridge:availability
+datasets: [daily, adj_factor, minute, realtime]
+description: "通达信 7709 行情协议(纯 Python 客户端), 提供 A股/ETF/指数 日K、分钟K(1m~60m)、除权因子、实时全市场快照与标的维表。数据未授权, 仅限个人学习研究。"
+install_hint: "Docker 需 --build-arg INCLUDE_ELTDX=1 才打包;开发模式: cd backend && pip install eltdx"

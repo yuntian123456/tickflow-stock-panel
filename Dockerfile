@@ -2,8 +2,11 @@
 # 可选:构建网络无法直连官方源时,传入 --build-arg USE_CN_MIRROR=1 启用国内镜像
 # 可选:stock-sdk 插件默认不打包(它抓取第三方财经网站接口,存在版权与反爬风险)。
 #       如确需启用,传入 --build-arg INCLUDE_STOCKSDK=1 显式开启,使用风险自负。
+# 可选:eltdx 插件默认不打包(通达信行情协议数据未获授权,存在合规风险)。
+#       如确需启用,传入 --build-arg INCLUDE_ELTDX=1 显式开启,使用风险自负。
 ARG USE_CN_MIRROR=1
 ARG INCLUDE_STOCKSDK=0
+ARG INCLUDE_ELTDX=0
 ARG NPM_REGISTRY=https://registry.npmmirror.com
 ARG PYPI_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 # 备用 PyPI 源:主源同步延迟/故障时自动兜底(阿里云与清华互为补充)
@@ -117,6 +120,14 @@ RUN if [ "$USE_CN_MIRROR" = "1" ]; then \
 # (<root>/backend/app/) 推导的, 容器内会错算到 /。这里用环境变量显式指定
 # 三个关键路径, 确保 static / tiers / data 都指向容器内正确位置。
 COPY backend/app ./app
+# eltdx 插件(python 型): 默认不打包(INCLUDE_ELTDX=0)。如启用, 按插件 requirements.txt
+# 安装 eltdx 到运行环境(.venv), 插件默认可用, 无需运行时再点「安装」。
+RUN if [ "$INCLUDE_ELTDX" = "1" ]; then \
+      if [ "$USE_CN_MIRROR" = "1" ]; then \
+        export UV_DEFAULT_INDEX="$PYPI_INDEX" UV_EXTRA_INDEX_URL="$PYPI_FALLBACK"; \
+      fi; \
+      uv pip install -r ./app/plugins/eltdx/requirements.txt; \
+    fi
 # stock-sdk 插件依赖: 从 stocksdk-builder 拷入。
 # INCLUDE_STOCKSDK=0(默认) 时, stocksdk-builder 产出空目录,此处拷入空目录,
 # 即最终镜像不含 stock-sdk 依赖,插件默认不可用。
