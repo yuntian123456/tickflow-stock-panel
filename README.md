@@ -1,4 +1,4 @@
-'''
+```yaml
 #version: '3.8'
 
 services:
@@ -19,4 +19,4 @@ services:
       - ./data:/app/data # 持久化保存股票数据与配置
       # 如果需要挂载自定义 tiers.yaml，取消下行注释即可：
       # - ./tiers.yaml:/app/tiers.yaml:ro
-      '''
+    ```
