@@ -2,7 +2,7 @@ name: Sync Main & Build Docker (with Stock-SDK)
 
 on:
   schedule:
-    - cron: '0 0,20 * * *'  # 每天 UTC 0:00（北京时间 8:00,20:00）自动运行
+    - cron: '0 0,12 * * *' # 每天 UTC 0:00 和 12:00（即北京时间 8:00 和 20:00）自动运行
   workflow_dispatch:       # 支持手动触发
   push:
     branches:
@@ -84,8 +84,10 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64
           push: true
+          # 关键修改：开启 stock-sdk，同时禁用国内镜像源（避免 Actions 海外节点连接国内超时）
           build-args: |
-            INCLUDE_STOCKSDK=1    # 打包 stock-sdk 插件
+            INCLUDE_STOCKSDK=1
+            USE_CN_MIRROR=0
           tags: |
             ${{ secrets.DOCKER_USERNAME }}/tickflow-stock-panel:latest
             ${{ secrets.DOCKER_USERNAME }}/tickflow-stock-panel:${{ steps.vars.outputs.sha_short }}
