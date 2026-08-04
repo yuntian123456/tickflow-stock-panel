@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sys
 import types
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import polars as pl
@@ -32,14 +32,29 @@ def _bar(time, close, high=None, low=None, volume=100, amount=10000.0):
 
 
 class FakeTdxClient:
-    """模拟 eltdx 客户端: 返回预设的 K线/因子/代码表/快照。"""
+    """模拟 eltdx 客户端: 返回预设的 K线/因子/代码表/快照。
 
-    def __init__(self, *, series=None, factors=None, codes=None, snapshots=None, period_log=None):
+    对齐 eltdx v1.2 真实 API:
+    - get_a_share_codes_all() 返回 list[str] (full_code 字符串)
+    - get_codes_all(market)    返回 list[SecurityCode] (含 name/code/exchange/category)
+    """
+
+    def __init__(
+        self,
+        *,
+        series=None,
+        factors=None,
+        codes=None,
+        snapshots=None,
+        period_log=None,
+        codes_all=None,
+    ):
         self._series = series
         self._factors = factors
         self._codes = codes
         self._snapshots = snapshots
         self._period_log = period_log
+        self._codes_all = codes_all or []
         self.bars = SimpleNamespace(all=self._bars_all, get=self._bars_get)
         self.quotes = SimpleNamespace(get_snapshots=self._quotes_get_snapshots)
 
@@ -62,6 +77,9 @@ class FakeTdxClient:
 
     def get_a_share_codes_all(self):
         return self._codes
+
+    def get_codes_all(self, market):
+        return [it for it in self._codes_all if getattr(it, "exchange", "") == market]
 
     def _quotes_get_snapshots(self, codes):
         return self._snapshots
@@ -199,8 +217,8 @@ def test_get_minute_aware_datetime_normalized(fake_eltdx):
     """eltdx 返回 UTC 带时区时间戳: 去时区为 naive 墙钟, 与 naive start/end_time 过滤不冲突。"""
     series = SimpleNamespace(
         bars=[
-            _bar(datetime(2026, 1, 2, 9, 31, tzinfo=timezone.utc), close=10.0),
-            _bar(datetime(2026, 1, 2, 14, 30, tzinfo=timezone.utc), close=10.5),
+            _bar(datetime(2026, 1, 2, 9, 31, tzinfo=UTC), close=10.0),
+            _bar(datetime(2026, 1, 2, 14, 30, tzinfo=UTC), close=10.5),
         ]
     )
     fake_eltdx(FakeTdxClient(series=series))
@@ -219,10 +237,8 @@ def test_get_minute_aware_datetime_normalized(fake_eltdx):
 
 
 def test_get_realtime(fake_eltdx):
-    codes = [
-        SimpleNamespace(full_code="sz000001"),
-        SimpleNamespace(full_code="sh600000"),
-    ]
+    # 对齐真实 API: get_a_share_codes_all() 返回 full_code 字符串列表
+    codes = ["sz000001", "sh600000"]
     snapshots = [
         SimpleNamespace(
             full_code="sz000001",
@@ -262,17 +278,30 @@ def test_get_realtime(fake_eltdx):
 
 
 def test_get_instruments(fake_eltdx):
-    codes = [
-        SimpleNamespace(full_code="sz000001", name="平安银行", code="000001", exchange="sz"),
-        SimpleNamespace(full_code="sh600000", name="浦发银行", code="600000", exchange="sh"),
+    # 对齐真实 API: get_codes_all(market) 返回 SecurityCode 对象 (含 category)
+    codes_all = [
+        SimpleNamespace(
+            full_code="sz000001", name="平安银行", code="000001", exchange="sz", category="a_share"
+        ),
+        SimpleNamespace(
+            full_code="sh600000", name="浦发银行", code="600000", exchange="sh", category="a_share"
+        ),
+        SimpleNamespace(
+            full_code="sh510300", name="沪深300ETF", code="510300", exchange="sh", category="etf"
+        ),
     ]
-    fake_eltdx(FakeTdxClient(codes=codes))
+    fake_eltdx(FakeTdxClient(codes_all=codes_all))
     provider = EltdxProvider()
     rows = provider.get_instruments("stock")
-    assert rows[0]["symbol"] == "000001.SZ"
-    assert rows[0]["name"] == "平安银行"
-    assert rows[0]["code"] == "000001"
-    assert rows[0]["exchange"] == "SZ"
-    assert rows[0]["region"] == "CN"
-    assert rows[0]["type"] == "stock"
-    assert rows[1]["exchange"] == "SH"
+    assert len(rows) == 2  # etf 被过滤
+    assert {r["symbol"] for r in rows} == {"000001.SZ", "600000.SH"}
+    by_symbol = {r["symbol"]: r for r in rows}
+    row = by_symbol["000001.SZ"]
+    assert row["name"] == "平安银行"
+    assert row["code"] == "000001"
+    assert row["exchange"] == "SZ"
+    assert row["region"] == "CN"
+    assert row["type"] == "stock"
+    assert by_symbol["600000.SH"]["exchange"] == "SH"
+    rows_etf = provider.get_instruments("etf")
+    assert [r["symbol"] for r in rows_etf] == ["510300.SH"]

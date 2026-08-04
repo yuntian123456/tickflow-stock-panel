@@ -63,7 +63,7 @@ def _to_symbol(full_code: str) -> str:
     return f"{code}.{_TDX_TO_EXCHANGE.get(ex, 'SZ')}"
 
 
-def _naive(t) -> "datetime":
+def _naive(t) -> datetime:
     """去掉时区保留墙钟时间: eltdx 返回 UTC 带时区 datetime, 而项目内
     start_time/end_time 均为无时区(naive)北京时间, 两者直接比较会因
     dtype 不一致报错。通达信协议的时间本就是交易所本地墙钟, 去 tz 后口径对齐。"""
@@ -228,9 +228,11 @@ class EltdxProvider:
         """全市场实时快照: 先取代码表, 再按 TDX 批量上限分批取快照拼成全市场。"""
         try:
             with self._client() as c:
+                # get_a_share_codes_all() 返回 list[str] (full_code, 如 "sh600000"),
+                # 直接作为快照批量查询入参, 不再取 .full_code 属性。
                 codes = c.get_a_share_codes_all()
                 out: list[dict] = []
-                for batch in chunked([cd.full_code for cd in codes or []], _SNAPSHOT_BATCH):
+                for batch in chunked(codes or [], _SNAPSHOT_BATCH):
                     quotes = c.quotes.get_snapshots(batch)
                     for q in quotes or []:
                         pct = getattr(q, "change_pct", None) or 0.0
@@ -254,27 +256,32 @@ class EltdxProvider:
 
     # ---- instruments ----
     def get_instruments(self, asset_type: str = "stock") -> list[dict]:
-        """标的维表, 供 instrument_sync 复用 flatten 路径(列结构与 tickflow 一致)。"""
+        """标的维表, 供 instrument_sync 复用 flatten 路径(列结构与 tickflow 一致)。
+
+        注意: eltdx 的 get_xxx_codes_all() 只返回 full_code 字符串, 不含
+        name/code/exchange; 这里改用 get_codes_all(market) 取 SecurityCode
+        对象并按 category 过滤 (a_share / etf / index)。
+        """
         try:
             with self._client() as c:
-                if asset_type == "etf":
-                    items = c.get_etf_codes_all()
-                elif asset_type == "index":
-                    items = c.get_index_codes_all()
-                else:
-                    items = c.get_a_share_codes_all()
-                return [
-                    {
-                        "symbol": _to_symbol(it.full_code),
-                        "name": it.name,
-                        "code": it.code,
-                        "exchange": (it.exchange or "").upper(),
-                        "region": "CN",
-                        "type": "stock",
-                        "ext": {},
-                    }
-                    for it in items or []
-                ]
+                target = {"etf": "etf", "index": "index"}.get(asset_type, "a_share")
+                items: list[dict] = []
+                for market in ("sh", "sz", "bj"):
+                    for it in c.get_codes_all(market):
+                        if getattr(it, "category", "") != target:
+                            continue
+                        items.append(
+                            {
+                                "symbol": _to_symbol(it.full_code),
+                                "name": it.name,
+                                "code": it.code,
+                                "exchange": (it.exchange or "").upper(),
+                                "region": "CN",
+                                "type": "stock",
+                                "ext": {},
+                            }
+                        )
+                return items
         except Exception as e:
             logger.warning("eltdx instruments 拉取失败: %s", e)
             return []
