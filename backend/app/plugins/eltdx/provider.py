@@ -254,6 +254,40 @@ class EltdxProvider:
             logger.warning("eltdx realtime 拉取失败: %s", e)
             return []
 
+    # ---- 测试(设置页试拉) ----
+    def test_dataset(self, dataset: str, symbols: list[str] | None = None) -> dict:
+        symbols = symbols or ["600519.SH"]
+        if dataset == "daily":
+            df = self.get_daily(symbols, None, None)
+            return self._preview("daily", df)
+        if dataset == "adj_factor":
+            df = self.get_adj_factors(symbols, None, None)
+            return self._preview("adj_factor", df)
+        if dataset == "minute":
+            df = self.get_minute(symbols, None, None)
+            return self._preview("minute", df)
+        if dataset == "realtime":
+            rows = self.get_realtime()
+            head = rows[:5]
+            return {
+                "provider": self.name,
+                "dataset": "realtime",
+                "rows": len(rows),
+                "columns": list(head[0].keys()) if head else [],
+                "preview": head,
+            }
+        raise ValueError(f"eltdx 不支持数据集: {dataset}")
+
+    @staticmethod
+    def _preview(dataset: str, df: pl.DataFrame) -> dict:
+        return {
+            "provider": "eltdx",
+            "dataset": dataset,
+            "rows": df.height,
+            "columns": df.columns,
+            "preview": df.head(5).to_dicts() if not df.is_empty() else [],
+        }
+
     # ---- instruments ----
     def get_instruments(self, asset_type: str = "stock") -> list[dict]:
         """标的维表, 供 instrument_sync 复用 flatten 路径(列结构与 tickflow 一致)。
