@@ -180,10 +180,17 @@ def test_get_daily_empty():
 
 
 def test_get_adj_factors(fake_eltdx):
+    """eltdx qfq_factor 是每日累积前复权系数, 应转换为除权事件因子。
+
+    事件因子 ex(D) = qfq(D)/qfq(D-1), 记在跳变日, 仅保留 |ex-1|>1e-9 的除权日;
+    序列首日无前值跳过, 无跳变的日常数(1.0)不产出因子行。
+    """
     factors = SimpleNamespace(
         items=[
-            SimpleNamespace(time=datetime(2026, 1, 2, 15, 0), qfq_factor=1.2345),
-            SimpleNamespace(time=datetime(2026, 2, 3, 15, 0), qfq_factor=1.3456),
+            SimpleNamespace(time=datetime(2026, 1, 2, 15, 0), qfq_factor=1.0),  # 首日: 跳过
+            SimpleNamespace(time=datetime(2026, 2, 3, 15, 0), qfq_factor=2.0),  # ex=2.0
+            SimpleNamespace(time=datetime(2026, 3, 4, 15, 0), qfq_factor=2.0),  # 无跳变: 滤除
+            SimpleNamespace(time=datetime(2026, 4, 5, 15, 0), qfq_factor=1.5),  # ex=0.75
         ]
     )
     fake_eltdx(FakeTdxClient(factors=factors))
@@ -191,8 +198,8 @@ def test_get_adj_factors(fake_eltdx):
     df = provider.get_adj_factors(["000001.SZ"], None, None)
     assert df.columns == ["symbol", "trade_date", "ex_factor"]
     assert df["symbol"].to_list() == ["000001.SZ", "000001.SZ"]
-    assert df["trade_date"].to_list() == [datetime(2026, 1, 2).date(), datetime(2026, 2, 3).date()]
-    assert df["ex_factor"].to_list() == [1.2345, 1.3456]
+    assert df["trade_date"].to_list() == [datetime(2026, 2, 3).date(), datetime(2026, 4, 5).date()]
+    assert df["ex_factor"].to_list() == [2.0, 0.75]
 
 
 # ---- minute ----
@@ -210,11 +217,14 @@ def test_get_minute_period_mapping(fake_eltdx, freq, expected):
     df = provider.get_minute(["000001.SZ"], None, None, freq=freq)
     assert period_log == [expected]
     assert df.columns == ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
-    assert df["datetime"].to_list() == [datetime(2026, 1, 2, 9, 31)]
+    assert df["datetime"].to_list() == [datetime(2026, 1, 2, 1, 31)]  # 9:31 北京墙钟 → 真实 UTC naive (-8h)
 
 
 def test_get_minute_aware_datetime_normalized(fake_eltdx):
-    """eltdx 返回 UTC 带时区时间戳: 去时区为 naive 墙钟, 与 naive start/end_time 过滤不冲突。"""
+    """eltdx 返回 UTC 带时区时间戳: 转真实 UTC naive (北京墙钟 -8h)。
+
+    与 tickflow from_epoch(ms)(UTC naive)及前端分时 fmtTime +8 还原口径一致。
+    """
     series = SimpleNamespace(
         bars=[
             _bar(datetime(2026, 1, 2, 9, 31, tzinfo=UTC), close=10.0),
@@ -230,7 +240,7 @@ def test_get_minute_aware_datetime_normalized(fake_eltdx):
         freq="1m",
     )
     assert df["datetime"].dtype == pl.Datetime("us")  # naive, 无时区
-    assert df["datetime"].to_list() == [datetime(2026, 1, 2, 9, 31)]
+    assert df["datetime"].to_list() == [datetime(2026, 1, 2, 1, 31)]  # 9:31 北京 → 01:31 UTC
 
 
 # ---- realtime ----
