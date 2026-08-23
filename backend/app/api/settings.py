@@ -63,6 +63,8 @@ def get_settings() -> dict:
         current_codex_reasoning_effort,
         current_openai_model,
         current_openai_reasoning_effort,
+        current_ai_context_window,
+        current_ai_max_output_tokens,
     )
 
     key = secrets_store.get_tickflow_key()
@@ -91,6 +93,8 @@ def get_settings() -> dict:
         "ai_codex_command": current_codex_command(),
         "ai_codex_reasoning_effort": current_codex_reasoning_effort(),
         "ai_user_agent": secrets_store.get_ai_config("ai_user_agent", settings.ai_user_agent),
+        "ai_max_output_tokens": current_ai_max_output_tokens(),
+        "ai_context_window": current_ai_context_window(),
     }
 
 
@@ -251,6 +255,8 @@ class AiSettingsIn(BaseModel):
     codex_command: str = ""
     codex_reasoning_effort: str = ""
     user_agent: str = ""
+    max_output_tokens: int | None = None   # 输出上限, 钳制所有任务的 max_tokens
+    context_window: int | None = None      # 输入上下文窗口上限 (约 token)
 
 
 @router.post("/ai")
@@ -267,6 +273,8 @@ def save_ai_settings(req: AiSettingsIn) -> dict:
         current_codex_reasoning_effort,
         current_openai_model,
         current_openai_reasoning_effort,
+        current_ai_context_window,
+        current_ai_max_output_tokens,
         normalize_codex_command,
         normalize_codex_model,
         normalize_codex_reasoning_effort,
@@ -307,6 +315,18 @@ def save_ai_settings(req: AiSettingsIn) -> dict:
     updates["ai_user_agent"] = req.user_agent
     settings.ai_user_agent = req.user_agent
 
+    # 输出上限 / 输入上下文窗口 (数值配置, 缺省保持原值)
+    if req.max_output_tokens is not None:
+        if req.max_output_tokens <= 0:
+            raise HTTPException(status_code=400, detail="输出上限必须为正整数")
+        updates["ai_max_output_tokens"] = req.max_output_tokens
+        settings.ai_max_output_tokens = req.max_output_tokens
+    if req.context_window is not None:
+        if req.context_window <= 0:
+            raise HTTPException(status_code=400, detail="上下文窗口必须为正整数")
+        updates["ai_context_window"] = req.context_window
+        settings.ai_context_window = req.context_window
+
     if updates:
         secrets_store.save(updates)
 
@@ -321,6 +341,8 @@ def save_ai_settings(req: AiSettingsIn) -> dict:
         "ai_codex_command": current_codex_command(),
         "ai_codex_reasoning_effort": current_codex_reasoning_effort(),
         "ai_configured": ai_configured(provider),
+        "ai_max_output_tokens": current_ai_max_output_tokens(),
+        "ai_context_window": current_ai_context_window(),
     }
 
 
@@ -342,6 +364,7 @@ def clear_ai_settings() -> dict:
         "ai_codex_command",
         "ai_codex_reasoning_effort",
     )
+    secrets_store.clear("ai_provider", "ai_base_url", "ai_api_key", "ai_model", "ai_codex_command", "ai_codex_reasoning_effort", "ai_max_output_tokens", "ai_context_window")
     # 同步重置运行时内存(provider 回默认值,其余置空)
     settings.ai_provider = "openai_compat"
     settings.ai_base_url = ""
@@ -349,6 +372,8 @@ def clear_ai_settings() -> dict:
     settings.ai_model = ""
     settings.ai_codex_command = "codex"
     settings.ai_codex_reasoning_effort = ""
+    settings.ai_max_output_tokens = 8192
+    settings.ai_context_window = 64000
 
     return {"ok": True}
 
@@ -810,6 +835,31 @@ def update_realtime_quotes(req: RealtimeQuotesPrefs, request: Request) -> dict:
     if req.realtime_quotes_enabled and qs and qs.is_paused():
         # 管道/数据修正运行期间禁止开启实时行情 — 防止写盘竞态
         raise HTTPException(status_code=409, detail="数据同步运行中，实时行情已临时暂停，请稍后再开启")
+    if req.realtime_quotes_enabled:
+        # 历史完整性门禁: 检测到最近交易日的盘中快照/缺口时禁止开启 —
+        # 实时 flush 写出"今天"分区后, 盘后管道的"只刷今天"分支会让停机日的
+        # 半日快照永久留存。同时自动创建修复任务, 修完即可正常开启。
+        from app.services import data_integrity
+
+        repo = getattr(request.app.state, "repo", None)
+        if repo is not None:
+            try:
+                issues = data_integrity.scan_recent_integrity(repo.store.data_dir)
+            except Exception:  # noqa: BLE001
+                issues = []
+            earliest = data_integrity.earliest_issue_day(issues)
+            if issues and data_integrity.within_auto_repair_window(earliest):
+                job_id, is_new = data_integrity.launch_integrity_repair(
+                    request.app.state, earliest, "realtime_gate",
+                )
+                if job_id is not None:
+                    detail = (
+                        f"检测到{data_integrity.describe_issues(issues)}，"
+                        + ("已自动创建修复任务，完成后即可开启实时行情"
+                           if is_new else "修复任务正在进行中，请稍后再开启")
+                        + f"（任务 {job_id}）"
+                    )
+                    raise HTTPException(status_code=409, detail=detail)
     if req.realtime_quotes_enabled and qs and qs.realtime_mode() == "watchlist" and not preferences.get_realtime_watchlist_symbols():
         preferences.save({"realtime_quotes_enabled": False})
         _sync_depth_polling(False)
