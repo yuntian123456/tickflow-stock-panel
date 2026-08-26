@@ -2,14 +2,12 @@
 # 见 ADR-17 / §8.1。
 services:
   app:
-    # 默认拉取远程镜像; 本地构建保留但先注释掉, 需要本地构建时取消注释并移除 image。
-    image: yuntian123456/tickflow-stock-panel:latest
-    # build:
-    #   context: .
-    #   dockerfile: Dockerfile
-    #   args:
-    #     BACKEND_EXTRAS: ${BACKEND_EXTRAS:-}
-    #     CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-0.144.3}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BACKEND_EXTRAS: ${BACKEND_EXTRAS:-}
+        CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-0.144.3}
     container_name: TickFlow_Stock_Panel
     ports:
       - "${HOST:-0.0.0.0}:${PORT:-3018}:3018"
