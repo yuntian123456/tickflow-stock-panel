@@ -11,13 +11,16 @@
 //   - volume: 沿用 tdx 库归一化结果; 项目约定为「手」。
 //   - 分钟 datetime: TDX 返回北京墙钟, 需转真实 UTC naive (墙钟 - 8h),
 //     与前端分时 +8 还原口径一致(参考 eltdx._to_utc_naive)。
-//   - 除权因子: 用 gb.QFQKlineDay 直接取前复权日线, 逐日 ex(D)=qfq(D)/qfq(D-1),
-//     仅保留跳变日(与 eltdx 的 ex_factor 事件因子语义一致)。
+//   - 除权因子: 直接由 gbbq(股本变迁)除权除息事件推导事件因子,
+//     ex = 前收盘 / 除权参考价 (XRXD.Pre), 覆盖现金分红(cat=1)与扩缩股/份额拆分(cat=11/12)。
+//     与 eltdx "本地复权因子" 语义一致(pipeline 按该日之后所有事件因子累乘做前复权)。
 package main
 
 import (
 	"encoding/json"
+	"math"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/injoyai/logs"
@@ -87,14 +90,19 @@ func respond(r response) {
 func opDaily(c *tdx.Client, args json.RawMessage) {
 	var a struct {
 		Symbols []string `json:"symbols"`
+		Count   int      `json:"count"` // 最多拉取的日K根数(限界, 避免全市场拉全量历史)
 	}
 	if err := json.Unmarshal(args, &a); err != nil {
 		respond(response{Ok: false, Error: "daily args: " + err.Error()})
 		return
 	}
-	rows := make([]map[string]any, 0, len(a.Symbols))
+	limit := a.Count
+	if limit <= 0 {
+		limit = 6000 // 默认全量历史(约 24 年), 与旧 GetKlineDayAll 一致
+	}
+	rows := make([]map[string]any, 0, len(a.Symbols)*min(limit, 300))
 	for _, code := range a.Symbols {
-		resp, err := fetchDayAll(c, code)
+		resp, err := fetchKlineBounded(c, protocol.TypeKlineDay, code, limit)
 		if err != nil {
 			continue // 单只失败不中断整批
 		}
@@ -106,8 +114,8 @@ func opDaily(c *tdx.Client, args json.RawMessage) {
 				"high":   k.High.Float64(),
 				"low":    k.Low.Float64(),
 				"close":  k.Close.Float64(),
-				"volume": k.Volume,             // 单位: 手(沿用库归一化)
-				"amount": k.Amount.Float64(),   // 单位: 元
+				"volume": k.Volume,           // 单位: 手(沿用库归一化)
+				"amount": k.Amount.Float64(), // 单位: 元
 			})
 		}
 	}
@@ -209,56 +217,114 @@ func fetchKlineBounded(c *tdx.Client, typ uint8, code string, limit int) (*proto
 
 func opAdjFactor(c *tdx.Client, args json.RawMessage) {
 	var a struct {
-		Symbols []string `json:"symbols"`
+		Symbols   []string `json:"symbols"`
+		Count     int      `json:"count"`      // 最多回看的日K根数(用于求"前收盘", 限界避免拉全量历史)
+		StartDate string   `json:"start_date"` // 起始日(含), 空=不限
+		EndDate   string   `json:"end_date"`   // 结束日(含), 空=不限
 	}
 	if err := json.Unmarshal(args, &a); err != nil {
 		respond(response{Ok: false, Error: "adj_factor args: " + err.Error()})
 		return
 	}
+	start, _ := parseDay(a.StartDate)
+	end, _ := parseDay(a.EndDate)
+	limit := a.Count
+	if limit <= 0 {
+		limit = 6000
+	}
 
-	rows := make([]map[string]any, 0)
+	rows := make([]map[string]any, 0, len(a.Symbols)*2)
 	for _, code := range a.Symbols {
-		resp, err := c.GetKlineDayAll(code)
-		if err != nil {
-			continue // 单只失败不中断整批
+		// 只回看窗口所需根数(而非 GetKlineDayAll 全量), 求前收盘价即可, 降低全市场除权拉取成本。
+		resp, err := fetchKlineBounded(c, protocol.TypeKlineDay, code, limit)
+		if err != nil || len(resp.List) == 0 {
+			continue
 		}
 		ks := resp.List // 不复权日线, 时间升序
+		last := ks[len(ks)-1].Time
 
-		// 用单标的接口直取除权除息事件, 避免 NewGbbq 首次触发全市场 Update(极慢)。
+		// 直取单标的除权除息事件, 避免 NewGbbq 首次触发全市场 Update(极慢)。
 		gbbqResp, err := c.GetGbbq(code)
 		if err != nil {
 			continue
 		}
-		var xrxds protocol.XRXDs
-		for _, g := range gbbqResp.List {
-			if g.IsXRXD() {
-				xrxds = append(xrxds, g.XRXD())
-			}
+		xrxds := buildXRXDs(gbbqResp.List)
+		if len(xrxds) == 0 {
+			continue
 		}
 
-		// Factors() 返回每日仿射复权系数; QFQMul 为纯比例乘法因子(锚定最新日=1.0,
-		// 非除权日恒为常量)。按 QFQMul 逐日比值得到纯净的除权事件因子(送转/配股),
-		// 不含日常涨跌噪声; 若用 qfq(D)/qfq(D-1) 会混入价格波动导致因子天天非1。
-		factors := xrxds.Pre(ks).Factors()
-
-		// ex(D) = QFQMul(D)/QFQMul(D-1), 仅保留 |ex-1|>1e-9 的除权跳变日(事件因子)。
-		var prev float64
-		for _, f := range factors {
-			cur := f.QFQMul
-			if prev != 0.0 {
-				ex := cur / prev
-				if abs(ex-1.0) > 1e-9 {
-					rows = append(rows, map[string]any{
-						"symbol":     code,
-						"trade_date": f.Time.Format("2006-01-02"),
-						"ex_factor":  ex,
-					})
-				}
+		for _, ev := range xrxds {
+			d := ev.Time
+			// 丢弃已公告未生效(未来除权日)与窗口外事件, 避免污染整条前复权。
+			if d.After(last) || (end != nil && d.After(*end)) || (start != nil && d.Before(*start)) {
+				continue
 			}
-			prev = cur
+			rawPrev := prevClose(ks, d)
+			if rawPrev <= 0 {
+				continue
+			}
+			pre := ev.Pre(protocol.Price(int64(math.Round(rawPrev * 1000)))).Float64()
+			if pre <= 0 {
+				continue
+			}
+			rows = append(rows, map[string]any{
+				"symbol":     code,
+				"trade_date": d.Format("2006-01-02"),
+				"ex_factor":  rawPrev / pre,
+			})
 		}
 	}
 	respond(response{Ok: true, Data: rows})
+}
+
+// buildXRXDs 把 gbbq 原始事件整理为可用于除权参考价推算的事件列表。
+//   - cat=1 除权除息: 直接转 XRXD(分红/送转/配股)。
+//   - cat=11/12 扩缩股(基金份额拆分/合并): 库的 GetXRXDs 只认 cat=1, 会漏掉, 这里补合成
+//     纯比例事件, 使 Pre(p)=p/C3, 从而 ex = p/Pre(p) = C3(1:3 拆分 → 因子 3.0)。
+func buildXRXDs(list []*protocol.Gbbq) protocol.XRXDs {
+	xrxds := protocol.XRXDs{}
+	for _, g := range list {
+		switch g.Category {
+		case 1:
+			xrxds = append(xrxds, g.XRXD())
+		case 11, 12:
+			if g.C3 > 0 {
+				xrxds = append(xrxds, &protocol.XRXD{
+					Code:        g.Code,
+					Time:        g.Time,
+					Songzhuangu: (g.C3 - 1) * 10,
+				})
+			}
+		}
+	}
+	sort.Slice(xrxds, func(i, j int) bool { return xrxds[i].Time.Before(xrxds[j].Time) })
+	return xrxds
+}
+
+// prevClose 返回事件日之前最近一个交易日(复权前)的收盘价, 无则 0。
+func prevClose(ks []*protocol.Kline, t time.Time) float64 {
+	dayStart := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.Local)
+	var prev float64
+	for _, k := range ks {
+		if k.Time.Before(dayStart) {
+			prev = k.Close.Float64()
+		} else {
+			break
+		}
+	}
+	return prev
+}
+
+// parseDay 解析 "2006-01-02" 为北京时间同日 15:00, 与 gbbq 事件时间口径对齐; 失败返回 nil。
+func parseDay(s string) (*time.Time, error) {
+	if s == "" {
+		return nil, nil
+	}
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", s+" 15:00:00", time.Local)
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
 }
 
 // ---- realtime ----
@@ -295,13 +361,13 @@ func opRealtime(c *tdx.Client, args json.RawMessage) {
 		if q.Kline == nil {
 			continue
 		}
-		last := q.Kline.Last.Float64()   // 昨收
-		cur := q.Kline.Close.Float64()   // 现价
+		last := q.Kline.Last.Float64() // 昨收
+		cur := q.Kline.Close.Float64() // 现价
 		pct := 0.0
 		if last != 0.0 {
 			pct = (cur - last) / last // 小数制(百分数/100)
 		}
-	// Quote.Exchange + Quote.Code 才是完整代码(如 sh600519); 单用 Code 会丢市场前缀。
+		// Quote.Exchange + Quote.Code 才是完整代码(如 sh600519); 单用 Code 会丢市场前缀。
 		exCode := q.Exchange.String() + q.Code
 		rows = append(rows, map[string]any{
 			"symbol":     exCode,
@@ -355,10 +421,10 @@ func opInstruments(c *tdx.Client, args json.RawMessage) {
 				// 仅支持 stock/etf/index
 			}
 			rows = append(rows, map[string]any{
-				"symbol":  full,
-				"name":    v.Name,
-				"code":    v.Code,
-				"exchange": ex.String(),
+				"symbol":     full,
+				"name":       v.Name,
+				"code":       v.Code,
+				"exchange":   ex.String(),
 				"asset_type": target,
 			})
 		}
@@ -403,11 +469,4 @@ func ensureCodes(c *tdx.Client) error {
 func beijingToUTC(t time.Time) string {
 	bj := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.FixedZone("CST", 8*3600))
 	return bj.UTC().Format(time.RFC3339)
-}
-
-func abs(f float64) float64 {
-	if f < 0 {
-		return -f
-	}
-	return f
 }

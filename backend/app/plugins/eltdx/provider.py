@@ -67,6 +67,63 @@ def _minute_count(start_time, end_time, period: str) -> int:
     return max(bars_per_day, trading_days * bars_per_day + bars_per_day)
 
 
+def _ex_events_from_qfq_items(items, symbol: str) -> list[dict]:
+    """把「每日累积前复权系数」序列转成事件因子: ex(D) = qfq(D)/qfq(D-1), 仅保留跳变日。
+
+    items 为 FactorRecord/FactorItem, 含 qfq_factor(每日累积前复权系数, 最新日=1.0)
+    与 time。pipeline 期望 ex_factor 为每次除权事件的 pre/post 比值(非累积系数)。
+    """
+    rows: list[dict] = []
+    prev_qfq = None
+    for item in sorted(items, key=lambda it: it.time):
+        qfq = float(getattr(item, "qfq_factor", 1.0))
+        if prev_qfq is not None and prev_qfq != 0.0:
+            ex = qfq / prev_qfq
+            if abs(ex - 1.0) > 1e-9:
+                rows.append({"symbol": symbol, "trade_date": item.time.date(), "ex_factor": ex})
+        prev_qfq = qfq
+    return rows
+
+
+def _ex_events_from_server_qfq(c, symbol: str, window_days: int | None) -> list[dict]:
+    """数据源未登记股本事件(如 ETF 份额拆分不在 xdxr/股本变迁中)时的兜底推导。
+
+    用服务端前复权K线(qfq)与不复权K线的比值推导事件因子:
+      cum(D) = qfq_close(D) / raw_close(D)   (累积前复权比值, 拆分为 1/3 → 1.0)
+      ex(D)  = cum(D) / cum(D-1)             (拆分日 ex≈3.0)
+    服务端 qfq 是通达信权威前复权, 能覆盖 xdxr 未登记的拆分。阈值 0.01 过滤
+    qfq/raw 的日内舍入漂移(~0.2%), 保留真实拆分/分红(通常>1%)。
+    """
+    count = min(window_days + _DAILY_SLACK, 800) if window_days is not None else 800
+    kind = _kind_for(symbol)
+
+    def _closes(adjust: str) -> dict:
+        s = c.bars.get(
+            _to_tdx(symbol), period="day", adjust=adjust, count=count, kind=kind,
+        )
+        return {b.time.strftime("%Y-%m-%d"): float(b.close) for b in (s.bars or [])}
+
+    try:
+        raw = _closes("none")
+        qfq = _closes("qfq")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("eltdx %s 服务端复权推导失败: %s", symbol, e)
+        return []
+    rows: list[dict] = []
+    prev_cum = None
+    for d in sorted(set(raw) & set(qfq)):
+        rc, qc = raw[d], qfq[d]
+        if rc == 0:
+            continue
+        cum = qc / rc
+        if prev_cum is not None and prev_cum != 0.0:
+            ex = cum / prev_cum
+            if abs(ex - 1.0) > 0.01:
+                rows.append({"symbol": symbol, "trade_date": d, "ex_factor": ex})
+        prev_cum = cum
+    return rows
+
+
 @dataclass
 class _EltdxConfig:
     """轻量 config shim, 让 custom loader 的 list_sources/provider_has_dataset 能识别本 provider。"""
@@ -290,9 +347,8 @@ class EltdxProvider:
             # 内部 bars.all 不带 kind(指数会解析错位), 故指数直接跳过。
             if _is_index_symbol(sym):
                 return None
-            # 快速路径: helpers.factors 内部是 bars.all(day) 全量翻页 + capital_changes, 实测 ~0.64s/只;
-            # 改单次 bars.get(day) + helpers.xdxr + build_factor_response, 实测 ~0.07s/只(约 9x 提速),
-            # 最近 30 交易日 qfq_factor 逐日对比零差异(基准验证)。窗口超出单页覆盖时回退全量保完整性。
+            # 主路径: 用数据源权威复权因子序列。小窗口走单次 bars.get + build_factor_response
+            # (快, ~0.07s/只; 依赖 xdxr 事件), 大窗口/未传窗口回退 helpers.factors 全量。
             window_days = None
             if start_time and end_time:
                 window_days = max(0, (end_time - start_time).days)
@@ -305,27 +361,20 @@ class EltdxProvider:
                     kind=_kind_for(sym),
                 )
                 factors = build_factor_response(series, c.helpers.xdxr(_to_tdx(sym)))
+                items = getattr(factors, "items", [])
             else:
                 factors = c.helpers.factors(_to_tdx(sym))
-            # eltdx 的 qfq_factor 是每日累积前复权系数(最新日=1.0), 并非除权事件因子。
-            # pipeline 期望 ex_factor = 每次除权事件的 pre/post 比值(个股级,非累积),
-            # 直接存每日系数会让 cum_prod 连乘爆表(f64→i64 溢出报错)。
+                items = getattr(factors, "items", [])
+            # eltdx 的 qfq_factor 是每日累积前复权系数(最新日=1.0), 并非除权事件因子;
+            # pipeline 期望 ex_factor = 每次除权事件的 pre/post 比值(个股级,非累积)。
             # 转换: ex(D) = qfq(D)/qfq(D-1), 记在跳变日(D), 仅保留 |ex-1|>1e-9 的除权日。
-            rows: list[dict] = []
-            prev_qfq: float | None = None
-            for item in sorted(factors.items or [], key=lambda it: it.time):
-                qfq = float(item.qfq_factor)
-                if prev_qfq is not None and prev_qfq != 0.0:
-                    ex = qfq / prev_qfq
-                    if abs(ex - 1.0) > 1e-9:
-                        rows.append(
-                            {
-                                "symbol": sym,
-                                "trade_date": item.time.date(),
-                                "ex_factor": ex,
-                            }
-                        )
-                prev_qfq = qfq
+            rows = _ex_events_from_qfq_items(items, sym)
+            # 兜底: 主路径无事件(如 ETF 份额拆分不在 xdxr/股本变迁中) → 从服务端
+            # 前复权K线(qfq)与不复权比值推导, 覆盖通达信未登记为股本事件的拆分。
+            if not rows:
+                rows = _ex_events_from_server_qfq(c, sym, window_days)
+            if not rows:
+                return None
             df = normalize_adj_factors(rows, source=self.name)
             if df.is_empty():
                 return None

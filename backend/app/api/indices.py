@@ -113,8 +113,6 @@ def get_index_minute(
     """实时读取指数分钟 K。不写入股票分钟 parquet。"""
     repo = request.app.state.repo
     info = _index_info(repo, symbol)
-    # 用北京日期而非服务器本地/UTC 日期: UTC 容器或跨日边界时 date.today()
-    # 会取到前一天, 导致指数分时显示昨天。
     day = trade_date or cn_today()
     df = kline_sync.fetch_minute_single(symbol, day, asset_type="index")
     return {

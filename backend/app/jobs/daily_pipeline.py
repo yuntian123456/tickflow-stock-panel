@@ -699,15 +699,11 @@ def _refresh_single_view(repo: KlineRepository, name: str) -> None:
 
 
 def _resolve_minute_symbols(capset: CapabilitySet, repo=None) -> list[str]:
-    """分钟 K 同步标的 — 与日K共用同一标的池, 并追加 ETF。
-
-    ETF 分钟写入独立的 kline_etf_minute (见 sync_and_persist_minute 的分流),
-    需把 ETF 符号纳入分钟同步池, 否则历史分时无数据。
-    """
-    base = set(_resolve_universe(capset, repo))
+    """分钟 K 同步标的 — 日K同一标的池 + ETF(独立 kline_etf_minute 落盘, 供历史分时查看)。"""
+    syms = set(_resolve_universe(capset, repo))
     if repo is not None:
-        base |= set(repo.get_etf_symbol_set())
-    return sorted(base)
+        syms.update(repo.get_etf_symbol_set())
+    return sorted(syms)
 
 
 def _refresh_instruments_view(repo: KlineRepository) -> None:

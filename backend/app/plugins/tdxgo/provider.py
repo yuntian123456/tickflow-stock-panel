@@ -48,6 +48,10 @@ _MINUTE_CANONICAL = ["symbol", "datetime", "open", "high", "low", "close", "volu
 _BARS_PER_DAY = {"1m": 240, "5m": 48, "15m": 16, "30m": 8, "60m": 4}
 # 桥接层(库)单次分钟K上限: 超此需分页, 且库本身最多 24000 根。
 _KLINE_MAX = 24000
+# 日K单标的根数上限(约 24 年 A股历史), 桥接层全年份拉全量会打爆桥接层内存。
+_DAILY_MAX = 6000
+# 日K单页(每次 TDX 请求)条数上限。
+_DAILY_PAGE = 800
 
 
 @dataclass
@@ -94,6 +98,16 @@ def _filter_daily(df: pl.DataFrame, start_time: datetime | None, end_time: datet
     return df
 
 
+def _filter_adj(df: pl.DataFrame, start_time: datetime | None, end_time: datetime | None) -> pl.DataFrame:
+    if df.is_empty():
+        return df
+    if start_time:
+        df = df.filter(pl.col("trade_date") >= start_time.date())
+    if end_time:
+        df = df.filter(pl.col("trade_date") <= end_time.date())
+    return df
+
+
 def _filter_minute(df: pl.DataFrame, start_time: datetime | None, end_time: datetime | None) -> pl.DataFrame:
     if df.is_empty():
         return df
@@ -128,6 +142,30 @@ def _minute_count(start_time: datetime | None, end_time: datetime | None, period
     else:
         trading_days = 4
     return max(bars_per_day, min(trading_days * bars_per_day + bars_per_day, _KLINE_MAX))
+
+
+def _daily_count(start_time: datetime | None, end_time: datetime | None) -> int:
+    """按窗口估算该拉的日K根数, 供桥接层限界拉取, 避免全市场拉全量历史打爆桥接层。"""
+    if start_time and end_time:
+        cal_days = max(1, (end_time - start_time).days)
+        trading_days = max(1, int(cal_days * 5 / 7) + 1)
+    else:
+        trading_days = 250  # 默认最近约 1 年
+    return max(1, min(trading_days + 5, _DAILY_MAX))
+
+
+def _adj_count(start_time: datetime | None, end_time: datetime | None) -> int:
+    """按窗口估算要回看的日K根数, 供桥接层求事件日的"前收盘价"。
+
+    除权事件落在 [start, end] 内时, 其前收盘价通常会落在窗口起点稍前, 故多加裕度回看;
+    无窗口(全量)则回看全历史, 确保能覆盖全部历史除权事件。
+    """
+    if start_time and end_time:
+        cal_days = max(1, (end_time - start_time).days)
+        trading_days = max(1, int(cal_days * 5 / 7) + 1)
+    else:
+        return _DAILY_MAX  # 全历史(约 24 年)
+    return max(1, min(trading_days + 30, _DAILY_MAX))
 
 
 class TdxGoProvider:
@@ -171,12 +209,12 @@ class TdxGoProvider:
         done = 0
         reported = 0
 
-        def tick() -> None:
+        def tick(n: int = 1) -> None:
             nonlocal done, reported
             if not on_chunk_done:
                 return
             with lock:
-                done += 1
+                done += n
                 target = tot_batches if done >= total else done // _BATCH
                 while reported < target:
                     reported += 1
@@ -190,6 +228,7 @@ class TdxGoProvider:
                 data = self._call(build_job(piece))
                 if isinstance(data, list):
                     out.extend(data)
+                tick(len(piece))  # 每批上报进度, 否则进度永不更新(前端卡死)
             return out
 
         results: list[list[dict]] = []
@@ -207,9 +246,11 @@ class TdxGoProvider:
         if not symbols:
             return pl.DataFrame()
         tdx_symbols = [_to_tdx(s) for s in symbols]
+        # 按窗口限界拉取: 桥接层不再逐年份拉全量历史(约6000根/只), 全市场会打爆桥接层。
+        count = _daily_count(start_time, end_time)
 
         def build_job(piece: list[str]) -> dict:
-            return {"op": "daily", "args": {"symbols": piece}}
+            return {"op": "daily", "args": {"symbols": piece, "count": count}}
 
         rows = self._run_concurrent(tdx_symbols, "daily", build_job, on_chunk_done)
         # 桥接返回的 symbol 是 sz000001, 归一回项目格式。
@@ -224,22 +265,25 @@ class TdxGoProvider:
         if not symbols:
             return pl.DataFrame()
         tdx_symbols = [_to_tdx(s) for s in symbols]
+        # 按窗口限界回看日K(求前收盘), 避免每只 GetKlineDayAll 全量历史导致全市场除权拉取过慢。
+        count = _adj_count(start_time, end_time)
+        start_date = start_time.date().isoformat() if start_time else None
+        end_date = end_time.date().isoformat() if end_time else None
 
         def build_job(piece: list[str]) -> dict:
-            return {"op": "adj_factor", "args": {"symbols": piece}}
+            args: dict = {"symbols": piece, "count": count}
+            if start_date:
+                args["start_date"] = start_date
+            if end_date:
+                args["end_date"] = end_date
+            return {"op": "adj_factor", "args": args}
 
         rows = self._run_concurrent(tdx_symbols, "adj_factor", build_job, on_chunk_done)
         for r in rows:
             if r.get("symbol"):
                 r["symbol"] = _to_symbol(r["symbol"])
         df = normalize_adj_factors(rows, source=self.name)
-        if df.is_empty():
-            return df
-        if start_time:
-            df = df.filter(pl.col("trade_date") >= start_time.date())
-        if end_time:
-            df = df.filter(pl.col("trade_date") <= end_time.date())
-        return df
+        return _filter_adj(df, start_time, end_time)
 
     # ---- minute ----
     def get_minute(self, symbols, start_time=None, end_time=None, asset_type="stock", freq="1m", on_chunk_done=None) -> pl.DataFrame:
