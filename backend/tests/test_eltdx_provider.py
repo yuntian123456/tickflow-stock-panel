@@ -48,6 +48,7 @@ class FakeTdxClient:
         snapshots=None,
         period_log=None,
         codes_all=None,
+        kind_log=None,
     ):
         self._series = series
         self._factors = factors
@@ -55,6 +56,7 @@ class FakeTdxClient:
         self._snapshots = snapshots
         self._period_log = period_log
         self._codes_all = codes_all or []
+        self._kind_log = kind_log
         self.bars = SimpleNamespace(all=self._bars_all, get=self._bars_get)
         self.quotes = SimpleNamespace(get_snapshots=self._quotes_get_snapshots)
 
@@ -64,10 +66,16 @@ class FakeTdxClient:
     def __exit__(self, *a):
         return False
 
+    def _record_kind(self, kwargs):
+        if self._kind_log is not None:
+            self._kind_log.append(kwargs.get("kind"))
+
     def _bars_all(self, code, **kwargs):
+        self._record_kind(kwargs)
         return self._series
 
     def _bars_get(self, code, period="day", **kwargs):
+        self._record_kind(kwargs)
         if self._period_log is not None:
             self._period_log.append(period)
         return self._series
@@ -77,6 +85,12 @@ class FakeTdxClient:
 
     def get_a_share_codes_all(self):
         return self._codes
+
+    def get_etf_codes_all(self):
+        return [it for it in (self._codes or []) if it.startswith(("sh5", "sz15", "sz16"))]
+
+    def get_index_codes_all(self):
+        return [it for it in (self._codes or []) if it.startswith(("sh000", "sz399", "sh880", "sh881", "bj899"))]
 
     def get_codes_all(self, market):
         return [it for it in self._codes_all if getattr(it, "exchange", "") == market]
@@ -315,3 +329,62 @@ def test_get_instruments(fake_eltdx):
     assert by_symbol["600000.SH"]["exchange"] == "SH"
     rows_etf = provider.get_instruments("etf")
     assert [r["symbol"] for r in rows_etf] == ["510300.SH"]
+
+
+# ---- 指数/ETF 修复回归: kind 透传与实时包含 ETF/指数 ----
+
+
+def test_get_daily_index_kind(fake_eltdx):
+    """指数日K 需给 bars 传 kind="index", 否则宽幅字段解析错位导致缺失。"""
+    kind_log: list[str | None] = []
+    series = SimpleNamespace(
+        bars=[
+            _bar(datetime(2026, 1, 2, 15, 0), close=3500.0, volume=1000, amount=1.0e7),
+        ]
+    )
+    fake_eltdx(FakeTdxClient(series=series, kind_log=kind_log))
+    provider = EltdxProvider()
+    df = provider.get_daily(["000001.SH"], None, None)
+    assert not df.is_empty()
+    assert kind_log == ["index"]
+
+
+def test_get_minute_index_kind(fake_eltdx):
+    """指数分钟K 需给 bars 传 kind="index"。"""
+    kind_log: list[str | None] = []
+    series = SimpleNamespace(bars=[_bar(datetime(2026, 1, 2, 9, 31), close=3500.0)])
+    fake_eltdx(FakeTdxClient(series=series, kind_log=kind_log))
+    provider = EltdxProvider()
+    df = provider.get_minute(["000001.SH"], None, None, freq="1m")
+    assert df.columns == ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
+    assert kind_log == ["index"]
+
+
+def test_get_daily_etf_kind_is_stock(fake_eltdx):
+    """ETF 走股票协议, kind 应为 "stock"(而非 index)。"""
+    kind_log: list[str | None] = []
+    series = SimpleNamespace(bars=[_bar(datetime(2026, 1, 2, 15, 0), close=4.6, volume=1000, amount=1.0e6)])
+    fake_eltdx(FakeTdxClient(series=series, kind_log=kind_log))
+    provider = EltdxProvider()
+    df = provider.get_daily(["510300.SH"], None, None)
+    assert not df.is_empty()
+    assert kind_log == ["stock"]
+
+
+def test_get_realtime_includes_etf_index(fake_eltdx):
+    """实时快照应包含 ETF 与指数代码(旧实现只拉 A股, 导致 etf/index 不更新)。"""
+    codes = ["sz000001", "sh600000", "sh510300", "sh000001"]
+    snapshots = [
+        SimpleNamespace(full_code="sz000001", last_price=11.0, pre_close_price=10.0, open_price=10.2, high_price=11.3, low_price=10.1, total_hand=1000, amount=1.0e6, change_pct=10.0),
+        SimpleNamespace(full_code="sh600000", last_price=8.0, pre_close_price=8.0, open_price=8.0, high_price=8.2, low_price=7.9, total_hand=500, amount=4.0e5, change_pct=-0.5),
+        SimpleNamespace(full_code="sh510300", last_price=4.6, pre_close_price=4.5, open_price=4.55, high_price=4.62, low_price=4.53, total_hand=20000, amount=9.0e7, change_pct=2.2),
+        SimpleNamespace(full_code="sh000001", last_price=3500.0, pre_close_price=3490.0, open_price=3495.0, high_price=3510.0, low_price=3480.0, total_hand=500000, amount=1.0e11, change_pct=0.29),
+    ]
+    fake_eltdx(FakeTdxClient(codes=codes, snapshots=snapshots))
+    provider = EltdxProvider()
+    rows = provider.get_realtime()
+    symbols = {r["symbol"] for r in rows}
+    assert {"510300.SH", "000001.SH"} <= symbols  # ETF 与指数都在实时快照里
+    by_symbol = {r["symbol"]: r for r in rows}
+    assert by_symbol["000001.SH"]["last_price"] == 3500.0
+    assert by_symbol["510300.SH"]["last_price"] == 4.6

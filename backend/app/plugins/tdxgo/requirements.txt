@@ -1,0 +1,2 @@
+# tdxgo 由 Go 二进制提供数据, runtime 为 none, 无 Python 额外依赖。
+# 仅需 Go 工具链编译桥接二进制: python build.py 或 go build

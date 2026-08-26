@@ -368,13 +368,20 @@ def test_manifest_declares_realtime_dataset():
     assert manifest.get("api_key_env") == fp.API_KEY_ENV
 
 
-def test_hidden_plugin_not_registered():
-    """hidden: true 的插件不注册、不在数据源页展示 (优化完成前隐藏 fuyao)。"""
+def test_fuyao_not_hidden_and_gated_by_key(monkeypatch):
+    """fuyao 已取消 hidden: 按正常可用性门控 —— 无 Key 时「展示但不可注册」。
+
+    原先隐藏逻辑: hidden=True 直接跳过, 不进 _PLUGIN_STATUS。现在取消隐藏后,
+    应走到 availability 自检, 无 Key 时记录 available=False(设置页展示安装提示)。
+    """
     from app.data_providers.custom import loader
     manifest = loader.plugin_manifest("fuyao")
-    assert manifest.get("hidden") is True
+    assert manifest is not None
+    assert manifest.get("hidden") is None  # 已移除 hidden 字段, 不再隐藏
+    monkeypatch.setattr(loader, "_call_check", lambda ref: (False, "未配置 FUYAO_API_KEY"))
     loader._register_one_plugin(manifest)
-    assert "fuyao" not in loader._PLUGIN_STATUS
+    assert "fuyao" in loader._PLUGIN_STATUS
+    assert loader._PLUGIN_STATUS["fuyao"]["available"] is False
     assert "fuyao" not in loader._PROVIDERS
 
 

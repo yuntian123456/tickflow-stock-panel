@@ -77,6 +77,28 @@ def _to_symbol(full_code: str) -> str:
     return f"{code}.{_TDX_TO_EXCHANGE.get(ex, 'SZ')}"
 
 
+def _is_index_symbol(symbol: str) -> bool:
+    """判断项目符号(如 000001.SH)是否为指数。
+
+    eltdx 把指数与股票/ETF 的 K 线协议区分开: bars 需传 kind="index", 否则解析器
+    不读宽幅(涨跌家数)字段会导致分钟/日K 错位而缺失。这里按代码模式判定。
+    """
+    full = _to_tdx(symbol)  # sh000001 / sz399001 / sh510300 ...
+    m, num = full[:2], full[2:]
+    if m == "sh":
+        return num.startswith(("000", "880", "881"))  # 上证系列/板块指数
+    if m == "sz":
+        return num.startswith("399")  # 深证系列指数
+    if m == "bj":
+        return num.startswith("899")  # 北证指数
+    return False
+
+
+def _kind_for(symbol: str) -> str:
+    """返回 bars 所需的 kind: 指数用 "index", 其余(股票/ETF)用 "stock"。"""
+    return "index" if _is_index_symbol(symbol) else "stock"
+
+
 def _naive(t) -> datetime:
     """去掉时区保留墙钟时间: eltdx 返回 UTC 带时区 datetime, 而项目内
     start_time/end_time 均为无时区(naive)北京时间, 两者直接比较会因
@@ -217,12 +239,14 @@ class EltdxProvider:
         use_single = window_days is not None and window_days + _DAILY_SLACK <= 800
 
         def fetch_one(c, sym) -> pl.DataFrame | None:
+            kind = _kind_for(sym)
             if use_single:
                 series = c.bars.get(
-                    _to_tdx(sym), period="day", adjust="none", count=window_days + _DAILY_SLACK
+                    _to_tdx(sym), period="day", adjust="none", count=window_days + _DAILY_SLACK,
+                    kind=kind,
                 )
             else:
-                series = c.bars.all(_to_tdx(sym), period="day", adjust="none")
+                series = c.bars.all(_to_tdx(sym), period="day", adjust="none", kind=kind)
             rows = [_bar_to_daily_row(b, sym) for b in (series.bars or [])]
             df = normalize_daily(rows, source=self.name)
             if df.is_empty():
@@ -249,6 +273,10 @@ class EltdxProvider:
             return pl.DataFrame()
 
         def fetch_one(c, sym) -> pl.DataFrame | None:
+            # 指数自身不发生分红/送转除权, 不产生 ex_factor; 且 eltdx get_factors
+            # 内部 bars.all 不带 kind(指数会解析错位), 故指数直接跳过。
+            if _is_index_symbol(sym):
+                return None
             # 快速路径: get_factors 内部是 bars.all(day) 全量翻页 + capital_changes, 实测 ~0.64s/只;
             # 改单次 bars.get(day) + get_xdxr + build_factor_response, 实测 ~0.07s/只(约 9x 提速),
             # 最近 30 交易日 qfq_factor 逐日对比零差异(基准验证)。窗口超出单页覆盖时回退全量保完整性。
@@ -314,12 +342,15 @@ class EltdxProvider:
             # 单次 count 上限 800 根(~4 个交易日), 只取一页会让历史窗口外的分钟数据
             # 全部缺失 → 前端只能看到最近 4 天。按 start 分页向前翻到覆盖窗口起点;
             # start_time 未传(设置页预览)时保持单页 800 根, 避免预览拉全量。
+            # 指数需传 kind="index", 否则宽幅字段导致协议解析错位(分钟K缺失)。
+            kind = _kind_for(sym)
             rows: list[dict] = []
             start = 0
             while True:
                 series = c.bars.get(
                     _to_tdx(sym), period=period, adjust="none",
                     start=start, count=_MINUTE_PAGE,
+                    kind=kind,
                 )
                 bars = series.bars or []
                 if not bars:
@@ -351,9 +382,14 @@ class EltdxProvider:
         """全市场实时快照: 先取代码表, 再按 TDX 批量上限分批取快照拼成全市场。"""
         try:
             with self._client() as c:
-                # get_a_share_codes_all() 返回 list[str] (full_code, 如 "sh600000"),
-                # 直接作为快照批量查询入参, 不再取 .full_code 属性。
-                codes = c.get_a_share_codes_all()
+                # 全市场实时快照需包含 ETF 与指数。旧实现只拉 A股代码,
+                # 导致 quote_service 切分后的 etf/index 无实时记录(数据不更新)。
+                # 三个 getter 底层共享_get_codes_all 缓存, 不会重复拉代码表。
+                codes = (
+                    c.get_a_share_codes_all()
+                    + c.get_etf_codes_all()
+                    + c.get_index_codes_all()
+                )
 
             # 先按 _SNAPSHOT_BATCH 分组, 再把组交给 _run_concurrent 并发分片:
             # _run_concurrent 是「每 worker 每 symbol 调一次 fetch_one」, 若把原始

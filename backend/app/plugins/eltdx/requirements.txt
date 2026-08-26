@@ -1,1 +1,5 @@
-eltdx>=1.2.0
+# 锁定 eltdx 1.x 系列: 本插件 provider 使用 eltdx 的模块化 API(bars/quotes)
+# 及部分旧版扁平入口(get_a_share_codes_all / get_codes_all / get_factors / get_xdxr
+# / get_minute / get_quote / get_gbbq)。上游 eltdx 自 2.0 起移除了这些扁平入口,
+# 若放开 >= 会被 Docker/uv 装上 3.x 导致插件破裂。故这里 pin 到 <2 保证一致、可运行。
+eltdx>=1.2,<2
