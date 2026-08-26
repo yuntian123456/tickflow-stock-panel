@@ -52,6 +52,19 @@ _DAILY_SLACK = 60
 # 1 分钟 240 根/交易日 → 单页约覆盖 3.3 个交易日, 需按 start 分页才能补全历史窗口。
 _MINUTE_PAGE = 800
 _MINUTE_CANONICAL = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
+# 每个 period 单交易日分钟K根数 (A股 9:30-11:30 + 13:00-15:00 = 240 分钟)。
+_BARS_PER_DAY = {"1m": 240, "5m": 48, "15m": 16, "30m": 8, "60m": 4}
+
+
+def _minute_count(start_time, end_time, period: str) -> int:
+    """按窗口估算该拉的分钟K根数, 作为首屏 count(小窗口避免一次拉满 800)。"""
+    bars_per_day = _BARS_PER_DAY.get(period, 240)
+    if start_time and end_time:
+        cal_days = max(1, (end_time - start_time).days)
+        trading_days = max(1, int(cal_days * 5 / 7) + 1)
+    else:
+        trading_days = 4
+    return max(bars_per_day, trading_days * bars_per_day + bars_per_day)
 
 
 @dataclass
@@ -338,6 +351,8 @@ class EltdxProvider:
         if not symbols:
             return pl.DataFrame()
         period = _PERIOD_MAP.get(freq, "1m")
+        # 首次页按窗口估算根数(小窗口不一次拉满 800), 更大窗口仍按 _MINUTE_PAGE 分页。
+        first_count = max(1, min(_minute_count(start_time, end_time, period), _MINUTE_PAGE))
 
         def fetch_one(c, sym) -> pl.DataFrame | None:
             # 单次 count 上限 800 根(~4 个交易日), 只取一页会让历史窗口外的分钟数据
@@ -348,9 +363,10 @@ class EltdxProvider:
             rows: list[dict] = []
             start = 0
             while True:
+                count = first_count if start == 0 else _MINUTE_PAGE
                 series = c.bars.get(
                     _to_tdx(sym), period=period, adjust="none",
-                    start=start, count=_MINUTE_PAGE,
+                    start=start, count=count,
                     kind=kind,
                 )
                 bars = series.bars or []
@@ -359,9 +375,9 @@ class EltdxProvider:
                 rows.extend(_bar_to_minute_row(b, sym) for b in bars)
                 if start_time is None or _naive(bars[0].time) < _naive(start_time):
                     break  # 预览模式 / 本页最早一根已早于窗口起点 → 覆盖完成
-                if len(bars) < _MINUTE_PAGE:
+                if len(bars) < count:
                     break  # 服务器无更早数据
-                start += _MINUTE_PAGE
+                start += count
             df = pl.DataFrame(rows) if rows else pl.DataFrame()
             if df.is_empty():
                 return None

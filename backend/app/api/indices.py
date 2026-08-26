@@ -9,6 +9,7 @@ import polars as pl
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.indicators.pipeline import compute_enriched
+from app.market_time import cn_today
 from app.services import index_sync, kline_sync
 from app.tickflow.capabilities import Cap
 
@@ -112,7 +113,9 @@ def get_index_minute(
     """实时读取指数分钟 K。不写入股票分钟 parquet。"""
     repo = request.app.state.repo
     info = _index_info(repo, symbol)
-    day = trade_date or date.today()
+    # 用北京日期而非服务器本地/UTC 日期: UTC 容器或跨日边界时 date.today()
+    # 会取到前一天, 导致指数分时显示昨天。
+    day = trade_date or cn_today()
     df = kline_sync.fetch_minute_single(symbol, day, asset_type="index")
     return {
         "symbol": symbol,

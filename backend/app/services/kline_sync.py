@@ -1031,7 +1031,9 @@ def sync_and_persist_minute(
     # 迁移:旧版按 symbol= 分区转为 date= 分区
     _migrate_symbol_to_date_partition(repo)
 
-    now = datetime.now()
+    # 用北京时间而非 datetime.now()(服务器本地/UTC): UTC 容器里 now 会早 8 小时,
+    # 使 end_time 经 provider._to_utc_naive 偏移后落在前一天, 导致今天分时不被同步。
+    now = cn_now()
 
     if extend_backward:
         # 向前扩展模式: 从本地最早数据往前补, 叠加已有数据避免缺口。
@@ -1070,24 +1072,39 @@ def sync_and_persist_minute(
 
     # 流式落盘: 每段拉完立即写盘, 内存峰值 = 单段 (而非全量)。
     # 全量攒内存曾导致 1 年全市场分钟 K OOM 卡死 (3 亿行 / 数十 GB)。
-    minute_dir = repo.store.data_dir / "kline_minute"
+    # 按存储目录分流: 股票+指数写入 kline_minute, ETF 写入独立的 kline_etf_minute,
+    # 与仓库 get_minute(asset_type=...) 的读取路由保持一致, 便于查看 ETF 历史分时。
     written_box = [0]  # list 闭包, 绕过 Python 闭包外层赋值
 
-    def _persist(seg_df: pl.DataFrame) -> None:
+    def _persist(seg_df: pl.DataFrame, minute_dir) -> None:
         # 单股自动补齐可能与另一个补齐请求同时写同一日期分区。Windows 不允许
         # 替换仍被另一写入占用的临时文件,因此读-改-写必须复用仓库写锁。
         with repo._write_lock:
             written_box[0] += _write_minute_partition(seg_df, minute_dir)
 
+    # 按存储目录拆分符号: resolve_asset_type 的指数/ETF 集合均已缓存, 逐只判断开销可忽略。
+    etf_syms: list[str] = []
+    other_syms: list[str] = []
+    for s in symbols:
+        (etf_syms if repo.resolve_asset_type(s) == "etf" else other_syms).append(s)
+
     segment_days = preferences.get_minute_sync_segment_days()
-    sync_minute_batch(
-        symbols, start_time=start_time, end_time=end_time,
-        batch_size=limit.batch, rpm=limit.rpm,
-        on_chunk_done=on_chunk_done,
-        segment_trading_days=segment_days,
-        on_segment=_persist,
-        asset_type="stock",
-    )
+    data_dir = repo.store.data_dir
+
+    def _run_group(group_syms: list[str], minute_dir, asset_type: str) -> None:
+        if not group_syms:
+            return
+        sync_minute_batch(
+            group_syms, start_time=start_time, end_time=end_time,
+            batch_size=limit.batch, rpm=limit.rpm,
+            on_chunk_done=on_chunk_done,
+            segment_trading_days=segment_days,
+            on_segment=lambda seg_df, _d=minute_dir: _persist(seg_df, minute_dir=_d),
+            asset_type=asset_type,
+        )
+
+    _run_group(other_syms, data_dir / "kline_minute", "stock")
+    _run_group(etf_syms, data_dir / "kline_etf_minute", "etf")
 
     if written_box[0] == 0:
         return 0

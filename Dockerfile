@@ -97,9 +97,9 @@ WORKDIR /app
 # 国内构建走 apt mirror 已在 debian 镜像sources.list 配好, 无需额外换源。
 # tesseract-ocr: 自选截图导入（始终安装）; nodejs: 仅 INCLUDE_STOCKSDK=1 时安装
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng \
+    && apt-get install -y --no-install-recommends --no-install-suggests tesseract-ocr tesseract-ocr-eng \
     && if [ "$INCLUDE_STOCKSDK" = "1" ]; then \
-         apt-get install -y --no-install-recommends nodejs \
+         apt-get install -y --no-install-recommends --no-install-suggests nodejs \
          && node --version; \
        fi \
     && rm -rf /var/lib/apt/lists/* \
@@ -144,7 +144,7 @@ RUN if [ "$INCLUDE_ELTDX" = "1" ]; then \
       if [ "$USE_CN_MIRROR" = "1" ]; then \
         export UV_DEFAULT_INDEX="$PYPI_INDEX" UV_EXTRA_INDEX_URL="$PYPI_FALLBACK"; \
       fi; \
-      uv pip install -r ./app/plugins/eltdx/requirements.txt; \
+      uv pip install --no-cache -r ./app/plugins/eltdx/requirements.txt; \
     fi
 # stock-sdk 插件依赖: 从 stocksdk-builder 拷入(INCLUDE_STOCKSDK=1 时含依赖)。
 # 若 INCLUDE_STOCKSDK=0, stocksdk-builder 产出空目录, 即最终镜像不含 stock-sdk 依赖。
@@ -164,6 +164,10 @@ COPY --from=frontend-builder /build/dist ./static
 # Codex CLI 使用官方 npm 包携带的当前平台原生二进制，无需运行时 Node.js。
 COPY --from=codex-builder /opt/codex-native /usr/local/bin/codex
 RUN codex --version
+
+# 清理所有缓存/字节码, 避免 wheel/索引/__pycache__ 打进最终镜像(可省数十~数百MB)。
+RUN find /app -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true; \
+    rm -rf /root/.cache /tmp/* 2>/dev/null || true
 
 ENV PYTHONPATH=/app
 # 兜底时区: 交易时段判断已在代码里显式用北京时间 (app/market_time.py),

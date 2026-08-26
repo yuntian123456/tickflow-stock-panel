@@ -148,24 +148,56 @@ def test_get_minute_filter_window(monkeypatch):
     assert df["datetime"].to_list() == [datetime(2026, 1, 2, 1, 31)]  # 窗口 [01:31, 01:59]: 02:00 被滤除
 
 
+def test_get_minute_filter_window_aware_tz(monkeypatch):
+    """真实调用方(fetch_minute_single / sync_and_persist_minute)传带时区(CN_TZ)的
+    aware 时间。provider 须先去 tzinfo 取北京墙钟再 -8h 比较, 否则 naive 列与 aware
+    时间比较抛 SchemaError → 自定义源异常 → 回退 TickFlow → 分时为空 (回归修复)。
+    """
+    from zoneinfo import ZoneInfo
+
+    bridge_rows = [
+        {"symbol": "sz000001", "datetime": "2026-01-02T01:31:00Z", "open": 10.0, "high": 10.1, "low": 9.9, "close": 10.0, "volume": 100, "amount": 1.0e5},
+        {"symbol": "sz000001", "datetime": "2026-01-02T02:00:00Z", "open": 10.2, "high": 10.3, "low": 10.1, "close": 10.2, "volume": 120, "amount": 1.2e5},
+    ]
+    monkeypatch.setattr(tdxgo_provider, "run_job", lambda job: bridge_rows)
+    provider = TdxGoProvider()
+    cn = ZoneInfo("Asia/Shanghai")
+    df = provider.get_minute(
+        ["000001.SZ"],
+        datetime(2026, 1, 2, 9, 31, tzinfo=cn),  # 北京墙钟 09:31+08:00 = UTC 01:31
+        datetime(2026, 1, 2, 9, 59, tzinfo=cn),  # 北京墙钟 09:59+08:00 = UTC 01:59
+        freq="1m",
+    )
+    # 不抛异常, 且窗口过滤正确: 02:00 (北京 10:00) 超出窗口被滤除
+    assert df["datetime"].to_list() == [datetime(2026, 1, 2, 1, 31)]
+
+
 # ---- realtime ----
 
 
 def test_get_realtime(monkeypatch):
-    """桥接层 change_pct 已是小数制(0.20 / -0.005)。"""
+    """桥接层 change_pct 已是小数制(0.20 / -0.005)。
+
+    get_realtime 现走 _run_concurrent 并发分片, 每 worker 只拉自己分到的代码;
+    mock 按请求 codes 过滤。结果顺序不保证, 故按 symbol 索引断言。
+    """
     bridge_rows = [
         {"symbol": "sz000001", "last_price": 12.0, "prev_close": 10.0, "open": 10.2, "high": 12.3, "low": 10.1, "volume": 123456, "amount": 1.5e8, "change_pct": 0.20},
         {"symbol": "sh600000", "last_price": 8.0, "prev_close": 8.0, "open": 8.0, "high": 8.2, "low": 7.9, "volume": 5000, "amount": 4e6, "change_pct": -0.005},
     ]
-    monkeypatch.setattr(tdxgo_provider, "run_job", lambda job: bridge_rows)
+
+    def fake_run_job(job):
+        codes = job["args"]["codes"]
+        return [r for r in bridge_rows if r["symbol"] in codes]
+
+    monkeypatch.setattr(tdxgo_provider, "run_job", fake_run_job)
     provider = TdxGoProvider()
     rows = provider.get_realtime(symbols=["000001.SZ", "600000.SH"])
     assert len(rows) == 2
-    assert rows[0]["symbol"] == "000001.SZ"
-    assert rows[0]["last_price"] == 12.0
-    assert rows[0]["change_pct"] == 0.20
-    assert rows[1]["symbol"] == "600000.SH"
-    assert rows[1]["change_pct"] == -0.005
+    by_symbol = {r["symbol"]: r for r in rows}
+    assert by_symbol["000001.SZ"]["last_price"] == 12.0
+    assert by_symbol["000001.SZ"]["change_pct"] == 0.20
+    assert by_symbol["600000.SH"]["change_pct"] == -0.005
 
 
 # ---- instruments ----

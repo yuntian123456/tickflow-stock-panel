@@ -44,6 +44,10 @@ _WORKERS = 8
 # 分钟K单日根数上限(1 分钟 240 根/交易日)。桥接层一次拉全量; 单位用做进度粒度。
 _MINUTE_PAGE = 800
 _MINUTE_CANONICAL = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
+# 每个 period 单交易日分钟K根数 (A股 9:30-11:30 + 13:00-15:00 = 240 分钟)。
+_BARS_PER_DAY = {"1m": 240, "5m": 48, "15m": 16, "30m": 8, "60m": 4}
+# 桥接层(库)单次分钟K上限: 超此需分页, 且库本身最多 24000 根。
+_KLINE_MAX = 24000
 
 
 @dataclass
@@ -94,11 +98,36 @@ def _filter_minute(df: pl.DataFrame, start_time: datetime | None, end_time: date
     if df.is_empty():
         return df
     # 桥接分钟时间已是真实 UTC naive; 调用方传北京墙钟, 需 -8h 后比较。
-    if start_time:
-        df = df.filter(pl.col("datetime") >= (start_time - timedelta(hours=8)))
-    if end_time:
-        df = df.filter(pl.col("datetime") <= (end_time - timedelta(hours=8)))
+    # 注意: 调用方(fetch_minute_single / sync_and_persist_minute)传的是带时区
+    # (CN_TZ) 的 aware datetime, 直接与 naive 列比较会抛 SchemaError(导致:
+    # 自定义源异常 → 回退 TickFlow → 分时为空)。须先去 tzinfo 取其北京墙钟再 -8h。
+    def _naive(t: datetime | None) -> datetime | None:
+        if t is None:
+            return None
+        return t.replace(tzinfo=None) if t.tzinfo is not None else t
+
+    st = _naive(start_time)
+    et = _naive(end_time)
+    if st:
+        df = df.filter(pl.col("datetime") >= (st - timedelta(hours=8)))
+    if et:
+        df = df.filter(pl.col("datetime") <= (et - timedelta(hours=8)))
     return df
+
+
+def _minute_count(start_time: datetime | None, end_time: datetime | None, period: str) -> int:
+    """按窗口估算该拉取的分钟K根数, 供桥接层限界拉取, 避免小窗口拉满库上限。
+
+    - 给了 start/end: 按自然日×5/7 估交易日, 加 1 天裕度覆盖节假日/边界;
+    - 未给(预览): 取最近 4 个交易日; 最终封顶 _KLINE_MAX。
+    """
+    bars_per_day = _BARS_PER_DAY.get(period, 240)
+    if start_time and end_time:
+        cal_days = max(1, (end_time - start_time).days)
+        trading_days = max(1, int(cal_days * 5 / 7) + 1)
+    else:
+        trading_days = 4
+    return max(bars_per_day, min(trading_days * bars_per_day + bars_per_day, _KLINE_MAX))
 
 
 class TdxGoProvider:
@@ -218,9 +247,11 @@ class TdxGoProvider:
             return pl.DataFrame()
         period = _PERIOD_MAP.get(freq, "1m")
         tdx_symbols = [_to_tdx(s) for s in symbols]
+        # 按窗口限界拉取: 桥接层不再拉满库上限 24000 根(约 91 天), 小窗口只拉所需根数。
+        count = _minute_count(start_time, end_time, period)
 
         def build_job(piece: list[str]) -> dict:
-            return {"op": "minute", "args": {"symbols": piece, "freq": period}}
+            return {"op": "minute", "args": {"symbols": piece, "freq": period, "count": count}}
 
         rows = self._run_concurrent(tdx_symbols, "minute", build_job, on_chunk_done)
         for r in rows:
@@ -243,12 +274,13 @@ class TdxGoProvider:
             if not codes:
                 return []
             tdx_codes = [_to_tdx(s) for s in codes]
-            rows: list[dict] = []
-            for i in range(0, len(tdx_codes), _BATCH):
-                piece = tdx_codes[i : i + _BATCH]
-                data = self._call({"op": "realtime", "args": {"codes": piece}})
-                if isinstance(data, list):
-                    rows.extend(data)
+
+            def build_job(piece: list[str]) -> dict:
+                return {"op": "realtime", "args": {"codes": piece}}
+
+            # 并发分片(与 daily/minute 一致): 顺序逐批会触发数百次子进程拉取,
+            # 全市场实时严重滞后。8 worker 每个子进程内再按 _BATCH 顺序拉, 摊薄开销。
+            rows = self._run_concurrent(tdx_codes, "realtime", build_job)
             for r in rows:
                 if r.get("symbol"):
                     r["symbol"] = _to_symbol(r["symbol"])

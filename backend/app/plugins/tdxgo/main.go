@@ -128,6 +128,7 @@ func opMinute(c *tdx.Client, args json.RawMessage) {
 	var a struct {
 		Symbols []string `json:"symbols"`
 		Freq    string   `json:"freq"`
+		Count   int      `json:"count"` // 最多拉取的分钟K根数(限界, 避免拉满库上限24000根)
 	}
 	if err := json.Unmarshal(args, &a); err != nil {
 		respond(response{Ok: false, Error: "minute args: " + err.Error()})
@@ -137,9 +138,13 @@ func opMinute(c *tdx.Client, args json.RawMessage) {
 	if !ok {
 		typ = protocol.TypeKlineMinute // 默认 1m
 	}
+	limit := a.Count
+	if limit <= 0 {
+		limit = 800 // 默认最近约 3.3 个交易日, 兼顾预览
+	}
 	rows := make([]map[string]any, 0)
 	for _, code := range a.Symbols {
-		resp, err := fetchKlineAll(c, typ, code)
+		resp, err := fetchKlineBounded(c, typ, code, limit)
 		if err != nil {
 			continue // 单只失败不中断整批
 		}
@@ -157,6 +162,47 @@ func opMinute(c *tdx.Client, args json.RawMessage) {
 		}
 	}
 	respond(response{Ok: true, Data: rows})
+}
+
+// fetchKlineBounded 只取最近 limit 根分钟K(指数走 GetIndex 口径), 分页按 800 前进。
+// 相比 GetKlineAll(库上限 24000 根, 约 91 天), 小窗口(如单日分时)只拉几十~几百根,
+// 避免全市场分钟同步把上百GB数据打回桥接层。
+func fetchKlineBounded(c *tdx.Client, typ uint8, code string, limit int) (*protocol.KlineResp, error) {
+	const page = 800
+	if limit <= 0 {
+		limit = page
+	}
+	if limit <= page {
+		if protocol.IsIndex(code) {
+			return c.GetIndex(typ, code, 0, uint16(limit))
+		}
+		return c.GetKline(typ, code, 0, uint16(limit))
+	}
+	resp := &protocol.KlineResp{}
+	for start := uint16(0); len(resp.List) < limit && start < 24000; start += page {
+		var r *protocol.KlineResp
+		var err error
+		if protocol.IsIndex(code) {
+			r, err = c.GetIndex(typ, code, start, page)
+		} else {
+			r, err = c.GetKline(typ, code, start, page)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if len(r.List) == 0 {
+			break
+		}
+		resp.List = append(r.List, resp.List...) // 旧页在前, 整体升序
+		if len(r.List) < page {
+			break // 已无更早数据
+		}
+	}
+	if len(resp.List) > limit {
+		resp.List = resp.List[len(resp.List)-limit:] // 仅保留最新 limit 根
+	}
+	resp.Count = uint16(len(resp.List))
+	return resp, nil
 }
 
 // ---- adj_factor ----
