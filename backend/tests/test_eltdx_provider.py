@@ -34,9 +34,11 @@ def _bar(time, close, high=None, low=None, volume=100, amount=10000.0):
 class FakeTdxClient:
     """模拟 eltdx 客户端: 返回预设的 K线/因子/代码表/快照。
 
-    对齐 eltdx v1.2 真实 API:
-    - get_a_share_codes_all() 返回 list[str] (full_code 字符串)
-    - get_codes_all(market)    返回 list[SecurityCode] (含 name/code/exchange/category)
+    对齐 eltdx v3.x 模块化 API:
+    - codes.all_a_shares() / all_etfs() / all_indices() 返回 list[str] (full_code)
+    - codes.all(market)  返回 list[SecurityCode] (含 name/code/exchange/category)
+    - helpers.factors(code) 返回 FactorResponse (含 .items)
+    - helpers.xdxr(code)     返回 list[XdxrRecord]
     """
 
     def __init__(
@@ -49,6 +51,7 @@ class FakeTdxClient:
         period_log=None,
         codes_all=None,
         kind_log=None,
+        xdxr=None,
     ):
         self._series = series
         self._factors = factors
@@ -57,8 +60,19 @@ class FakeTdxClient:
         self._period_log = period_log
         self._codes_all = codes_all or []
         self._kind_log = kind_log
+        self._xdxr = xdxr or []
         self.bars = SimpleNamespace(all=self._bars_all, get=self._bars_get)
         self.quotes = SimpleNamespace(get_snapshots=self._quotes_get_snapshots)
+        self.codes = SimpleNamespace(
+            all_a_shares=self.codes_all_a_shares,
+            all_etfs=self.codes_all_etfs,
+            all_indices=self.codes_all_indices,
+            all=self.codes_all_market,
+        )
+        self.helpers = SimpleNamespace(
+            factors=self._helpers_factors,
+            xdxr=self._helpers_xdxr,
+        )
 
     def __enter__(self):
         return self
@@ -80,20 +94,29 @@ class FakeTdxClient:
             self._period_log.append(period)
         return self._series
 
-    def get_factors(self, code):
-        return self._factors
+    # ---- codes 模块(all_xxx 返回 full_code 字符串, 按前缀分类为互斥三类) ----
+    def codes_all_a_shares(self):
+        return [
+            it
+            for it in (self._codes or [])
+            if not it.startswith(("sh000", "sz399", "sh880", "sh881", "bj899", "sh5", "sz15", "sz16", "sh56", "sh58"))
+        ]
 
-    def get_a_share_codes_all(self):
-        return self._codes
+    def codes_all_etfs(self):
+        return [it for it in (self._codes or []) if it.startswith(("sh5", "sz15", "sz16", "sh56", "sh58"))]
 
-    def get_etf_codes_all(self):
-        return [it for it in (self._codes or []) if it.startswith(("sh5", "sz15", "sz16"))]
-
-    def get_index_codes_all(self):
+    def codes_all_indices(self):
         return [it for it in (self._codes or []) if it.startswith(("sh000", "sz399", "sh880", "sh881", "bj899"))]
 
-    def get_codes_all(self, market):
+    def codes_all_market(self, market):
         return [it for it in self._codes_all if getattr(it, "exchange", "") == market]
+
+    # ---- helpers 模块 ----
+    def _helpers_factors(self, code):
+        return self._factors
+
+    def _helpers_xdxr(self, code):
+        return self._xdxr
 
     def _quotes_get_snapshots(self, codes):
         return self._snapshots
@@ -261,7 +284,7 @@ def test_get_minute_aware_datetime_normalized(fake_eltdx):
 
 
 def test_get_realtime(fake_eltdx):
-    # 对齐真实 API: get_a_share_codes_all() 返回 full_code 字符串列表
+    # 对齐真实 API: codes.all_a_shares() 返回 full_code 字符串列表
     codes = ["sz000001", "sh600000"]
     snapshots = [
         SimpleNamespace(
@@ -302,7 +325,7 @@ def test_get_realtime(fake_eltdx):
 
 
 def test_get_instruments(fake_eltdx):
-    # 对齐真实 API: get_codes_all(market) 返回 SecurityCode 对象 (含 category)
+    # 对齐真实 API: codes.all(market) 返回 SecurityCode 对象 (含 category)
     codes_all = [
         SimpleNamespace(
             full_code="sz000001", name="平安银行", code="000001", exchange="sz", category="a_share"

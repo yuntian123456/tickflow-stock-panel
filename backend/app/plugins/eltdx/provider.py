@@ -273,12 +273,12 @@ class EltdxProvider:
             return pl.DataFrame()
 
         def fetch_one(c, sym) -> pl.DataFrame | None:
-            # 指数自身不发生分红/送转除权, 不产生 ex_factor; 且 eltdx get_factors
+            # 指数自身不发生分红/送转除权, 不产生 ex_factor; 且 helpers.factors
             # 内部 bars.all 不带 kind(指数会解析错位), 故指数直接跳过。
             if _is_index_symbol(sym):
                 return None
-            # 快速路径: get_factors 内部是 bars.all(day) 全量翻页 + capital_changes, 实测 ~0.64s/只;
-            # 改单次 bars.get(day) + get_xdxr + build_factor_response, 实测 ~0.07s/只(约 9x 提速),
+            # 快速路径: helpers.factors 内部是 bars.all(day) 全量翻页 + capital_changes, 实测 ~0.64s/只;
+            # 改单次 bars.get(day) + helpers.xdxr + build_factor_response, 实测 ~0.07s/只(约 9x 提速),
             # 最近 30 交易日 qfq_factor 逐日对比零差异(基准验证)。窗口超出单页覆盖时回退全量保完整性。
             window_days = None
             if start_time and end_time:
@@ -289,10 +289,11 @@ class EltdxProvider:
                 series = c.bars.get(
                     _to_tdx(sym), period="day", adjust="none",
                     count=window_days + _DAILY_SLACK,
+                    kind=_kind_for(sym),
                 )
-                factors = build_factor_response(series, c.get_xdxr(_to_tdx(sym)))
+                factors = build_factor_response(series, c.helpers.xdxr(_to_tdx(sym)))
             else:
-                factors = c.get_factors(_to_tdx(sym))
+                factors = c.helpers.factors(_to_tdx(sym))
             # eltdx 的 qfq_factor 是每日累积前复权系数(最新日=1.0), 并非除权事件因子。
             # pipeline 期望 ex_factor = 每次除权事件的 pre/post 比值(个股级,非累积),
             # 直接存每日系数会让 cum_prod 连乘爆表(f64→i64 溢出报错)。
@@ -384,11 +385,11 @@ class EltdxProvider:
             with self._client() as c:
                 # 全市场实时快照需包含 ETF 与指数。旧实现只拉 A股代码,
                 # 导致 quote_service 切分后的 etf/index 无实时记录(数据不更新)。
-                # 三个 getter 底层共享_get_codes_all 缓存, 不会重复拉代码表。
+                # 三个 codes 方法底层共享 codes.all_markets() 缓存, 不会重复拉代码表。
                 codes = (
-                    c.get_a_share_codes_all()
-                    + c.get_etf_codes_all()
-                    + c.get_index_codes_all()
+                    c.codes.all_a_shares()
+                    + c.codes.all_etfs()
+                    + c.codes.all_indices()
                 )
 
             # 先按 _SNAPSHOT_BATCH 分组, 再把组交给 _run_concurrent 并发分片:
@@ -464,16 +465,16 @@ class EltdxProvider:
     def get_instruments(self, asset_type: str = "stock") -> list[dict]:
         """标的维表, 供 instrument_sync 复用 flatten 路径(列结构与 tickflow 一致)。
 
-        注意: eltdx 的 get_xxx_codes_all() 只返回 full_code 字符串, 不含
-        name/code/exchange; 这里改用 get_codes_all(market) 取 SecurityCode
-        对象并按 category 过滤 (a_share / etf / index)。
+        注意: codes.all_xxx() 只返回 full_code 字符串, 不含 name/code/exchange;
+        这里改用 codes.all(market) 取 SecurityCode 对象并按 category 过滤
+        (a_share / etf / index)。
         """
         try:
             with self._client() as c:
                 target = {"etf": "etf", "index": "index"}.get(asset_type, "a_share")
                 items: list[dict] = []
                 for market in ("sh", "sz", "bj"):
-                    for it in c.get_codes_all(market):
+                    for it in c.codes.all(market):
                         if getattr(it, "category", "") != target:
                             continue
                         items.append(
