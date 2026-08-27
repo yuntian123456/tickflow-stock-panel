@@ -23,9 +23,11 @@ import logging
 import threading as _threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import polars as pl
 
+from app.config import settings
 from app.data_providers.normalizer import normalize_adj_factors, normalize_daily
 from app.tickflow.rate_limits import chunked
 
@@ -45,6 +47,12 @@ _SNAPSHOT_BATCH = 80
 # 实测(20只日K): 逐只建连 2.49s → 8 worker 分片复用 0.70s, 提升 ~3.5 倍;
 # 4/8/16 worker 差距极小(0.71/0.70/0.67s), 取 8 平衡速度与服务器压力。
 _WORKERS = 8
+# 实时快照专用并发: 全市场每轮轮询(秒级), 8 个连接并发拉快照 CPU 偏高;
+# 4 个连接即可覆盖网络延迟, 降低 CPU 与服务器压力。
+_REALTIME_WORKERS = 4
+# 股本(财务)批量拉取分块大小: finance_batch 每次请求的代码数上限(通达信协议限制),
+# 超出需分块; instruments_sync 盘前一次性全量拉。
+_FINANCE_BATCH = 100
 # 日K窗口缓存余量(交易日): 按 start/end 窗口估算条数时多加的裕度, 覆盖
 # 边界非交易日/服务器截断等场景; 单次 bars.get(count) 服务端上限 800。
 _DAILY_SLACK = 60
@@ -164,6 +172,17 @@ def _is_index_symbol(symbol: str) -> bool:
     return False
 
 
+def _is_block_code(full_code: str) -> bool:
+    """判断 TDX full_code(sh880076/sz000001) 或项目符号是否为通达信板块指数。
+
+    880xxx(概念/风格/地区)、881xxx(行业)是通达信板块指数, 归属上海交易所但非可交易
+    A 股。主项目实时拆分的 index 集合来自 TickFlow 的 instruments_index(不含板块指数),
+    若不剔除会被当作 stock 写入 kline_daily, 污染涨幅/成交额榜。
+    """
+    num = full_code[2:] if len(full_code) >= 8 else full_code
+    return num[:3] in ("880", "881")
+
+
 def _kind_for(symbol: str) -> str:
     """返回 bars 所需的 kind: 指数用 "index", 其余(股票/ETF)用 "stock"。"""
     return "index" if _is_index_symbol(symbol) else "stock"
@@ -228,6 +247,11 @@ class EltdxProvider:
 
     def __init__(self) -> None:
         self.config = _EltdxConfig()
+        # 受管指数/ETF 集合缓存(读维表 parquet)。get_realtime 秒级轮询, 每轮读文件浪费;
+        # TTL 内复用, 维表变更在 TTL 刷新后自动生效。
+        self._managed_cache: dict[str, set[str]] = {}
+        self._managed_cache_at: float = 0.0
+        self._managed_cache_ttl = 300.0
 
     def close(self) -> None:  # loader.load_all 会对每个 provider 调 close
         pass
@@ -238,11 +262,12 @@ class EltdxProvider:
 
         return TdxClient(timeout=10)
 
-    def _run_concurrent(self, symbols: list[str], fetch_one, on_chunk_done=None) -> list:
-        """静态分片并发拉取: symbols 均分给 _WORKERS 个 worker, 每个 worker 建连一次并复用。
+    def _run_concurrent(self, symbols: list[str], fetch_one, on_chunk_done=None, workers: int | None = None) -> list:
+        """静态分片并发拉取: symbols 均分给 worker 个 worker, 每个 worker 建连一次并复用。
 
         fetch_one(c, sym) -> 返回该 symbol 的结果(DataFrame / dict / None), 异常由框架捕获记日志。
         返回所有成功结果的列表(顺序不保证); on_chunk_done(cur, tot) 按 _BATCH 粒度回调进度。
+        workers 可覆盖默认 _WORKERS: 实时快照(秒级轮询)传小值以降低每轮连接数。
 
         进度实时性: worker 每拉完一只即上报(非等整块完成), 否则慢服务器下
         首个 worker 完成前进度长时间不动, 前端误判为卡死。
@@ -250,7 +275,8 @@ class EltdxProvider:
         if not symbols:
             return []
         total = len(symbols)
-        size = max(1, (total + _WORKERS - 1) // _WORKERS)
+        n_workers = min(workers or _WORKERS, total)
+        size = max(1, (total + n_workers - 1) // n_workers)
         chunks = [symbols[i : i + size] for i in range(0, total, size)]
         tot_batches = (total + _BATCH - 1) // _BATCH
         lock = _threading.Lock()
@@ -444,6 +470,31 @@ class EltdxProvider:
         return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
 
     # ---- realtime ----
+    def _read_managed_symbols(self, dirname: str) -> set[str]:
+        """读取主项目已同步的指数/ETF 维表代码集(目录形态 data/<dirname>/<dirname>.parquet)。
+
+        实时快照据此只返回主项目受管的指数/ETF, 避免其余指数/ETF 被当作股票写入 kline_daily。
+        结果按实例级 TTL 缓存(秒级轮询不重复读文件), 维表变更在 TTL 刷新后自动生效。
+        文件缺失/为空/读取失败时返回空集(调用方据此跳过过滤, 回退旧行为)。
+        """
+        import time as _t
+        now = _t.monotonic()
+        if now - self._managed_cache_at < self._managed_cache_ttl and dirname in self._managed_cache:
+            return self._managed_cache[dirname]
+        try:
+            p = Path(settings.data_dir) / dirname / f"{dirname}.parquet"
+            out = set()
+            if p.exists():
+                df = pl.read_parquet(p, columns=["symbol"])
+                if not df.is_empty():
+                    out = set(df["symbol"].cast(pl.Utf8).to_list())
+        except Exception as e:  # noqa: BLE001
+            logger.warning("eltdx 读取 %s 受管集合失败: %s", dirname, e)
+            out = set()
+        self._managed_cache[dirname] = out
+        self._managed_cache_at = now
+        return out
+
     def get_realtime(self) -> list[dict]:
         """全市场实时快照: 先取代码表, 再按 TDX 批量上限分批取快照拼成全市场。"""
         try:
@@ -451,11 +502,22 @@ class EltdxProvider:
                 # 全市场实时快照需包含 ETF 与指数。旧实现只拉 A股代码,
                 # 导致 quote_service 切分后的 etf/index 无实时记录(数据不更新)。
                 # 三个 codes 方法底层共享 codes.all_markets() 缓存, 不会重复拉代码表。
-                codes = (
-                    c.codes.all_a_shares()
-                    + c.codes.all_etfs()
-                    + c.codes.all_indices()
-                )
+                # 只返回主项目已同步的指数/ETF(受管集合): 其余指数(通达信板块指数 880/881xxx、
+                # 999xxx、399379/399380 等统计指数)会被 quote_service 当作 stock 写入
+                # kline_daily, 污染涨幅/成交额榜。受管集合每次轮询重建时重新读取, 维表变更
+                # 会在代码表缓存(TTL)刷新后自动生效; 集合为空(未同步)则不过滤, 回退旧行为。
+                idx_set = self._read_managed_symbols("instruments_index")
+                etf_set = self._read_managed_symbols("instruments_etf")
+                codes = []
+                codes += c.codes.all_a_shares()
+                codes += [
+                    x for x in c.codes.all_etfs()
+                    if not etf_set or _to_symbol(x) in etf_set
+                ]
+                codes += [
+                    x for x in c.codes.all_indices()
+                    if not _is_block_code(x) and (not idx_set or _to_symbol(x) in idx_set)
+                ]
 
             # 先按 _SNAPSHOT_BATCH 分组, 再把组交给 _run_concurrent 并发分片:
             # _run_concurrent 是「每 worker 每 symbol 调一次 fetch_one」, 若把原始
@@ -483,7 +545,8 @@ class EltdxProvider:
                 return out
 
             # 静态分片并发: 每个 worker 一个连接, 每次快照调用不超过 80 个代码
-            out_all: list[list[dict]] = self._run_concurrent(groups, fetch_one)
+            # 实时快照是秒级轮询, 4 个连接即可摊薄网络延迟, 避免每轮 8 连接并发拉全市场。
+            out_all: list[list[dict]] = self._run_concurrent(groups, fetch_one, workers=_REALTIME_WORKERS)
             merged: list[dict] = []
             for batch in out_all:
                 merged.extend(batch)
@@ -538,10 +601,15 @@ class EltdxProvider:
             with self._client() as c:
                 target = {"etf": "etf", "index": "index"}.get(asset_type, "a_share")
                 items: list[dict] = []
+                full_codes: list[str] = []
                 for market in ("sh", "sz", "bj"):
                     for it in c.codes.all(market):
                         if getattr(it, "category", "") != target:
                             continue
+                        if target == "index" and _is_block_code(it.full_code):
+                            # 通达信板块指数(880/881xxx)非可交易 A 股, 不入维表
+                            continue
+                        full_codes.append(it.full_code)
                         items.append(
                             {
                                 "symbol": _to_symbol(it.full_code),
@@ -553,7 +621,38 @@ class EltdxProvider:
                                 "ext": {},
                             }
                         )
+                # 股票补流通/总股本(供换手率计算), 写进 ext 由 flatten 读取
+                if asset_type == "stock" and full_codes:
+                    share_map = self._fetch_shares(c, full_codes)
+                    for item in items:
+                        s = share_map.get(item["symbol"])
+                        if s:
+                            item["ext"].update(s)
                 return items
         except Exception as e:
             logger.warning("eltdx instruments 拉取失败: %s", e)
             return []
+
+    @staticmethod
+    def _fetch_shares(c, full_codes: list[str]) -> dict[str, dict]:
+        """用 corporate.finance_batch 拉流通/总股本(单位: 股), 按 project symbol 缓存返回。
+
+        单块失败跳过, 不阻断整批; finance_batch 内部按协议上限分块, 这里再按
+        _FINANCE_BATCH 分块以控制单次请求规模。
+        """
+        share_map: dict[str, dict] = {}
+        for chunk in chunked(full_codes, _FINANCE_BATCH):
+            try:
+                batch = c.corporate.finance_batch(list(chunk), fields=["流通股本", "总股本"])
+            except Exception as e:  # noqa: BLE001
+                logger.warning("eltdx finance_batch 失败(跳过该批): %s", e)
+                continue
+            for rec in batch or []:
+                fc = (rec or {}).get("full_code")
+                if not fc:
+                    continue
+                share_map[_to_symbol(fc)] = {
+                    "float_shares": (rec or {}).get("流通股本"),
+                    "total_shares": (rec or {}).get("总股本"),
+                }
+        return share_map

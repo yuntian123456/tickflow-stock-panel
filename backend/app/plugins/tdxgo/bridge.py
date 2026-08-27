@@ -69,8 +69,8 @@ def _binary() -> Path:
 def _timeout(job: dict) -> float:
     """按 op 区分超时: 全量日K/分钟/标的可能较慢, realtime/单标的给短些。"""
     op = job.get("op")
-    if op in ("daily", "minute", "adj_factor", "instruments"):
-        return 90.0
+    if op in ("daily", "minute", "adj_factor", "instruments", "finance"):
+        return 120.0
     return 30.0
 
 

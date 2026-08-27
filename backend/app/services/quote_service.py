@@ -743,10 +743,11 @@ class QuoteService:
             self._flush_live_enriched(daily_df, quote_extra, asset_type="stock")
         if not etf_daily_df.is_empty() and self._repo:
             self._flush_live_enriched(etf_daily_df, etf_quote_extra, asset_type="etf")
-        # ---- 指数: 仅有指数监控规则时才写盘 (无规则零成本) ----
+        # ---- 指数: 只要有指数记录就写盘, 保证盘中指数日K/分时更新到当天 ----
+        # 旧实现仅在「配置了指数监控规则」时才写盘, 导致无监控规则的用户盘中指数日K停在昨天
+        # (指数日K接口读 kline_index_daily, 今天没写入就只返回昨天, 前端分时随之停在昨天)。
         # mode=all (完整 CN_Index universe) → flush 覆盖; mode=core (部分标的) → merge 不截断分区
-        engine = getattr(self._app_state, "monitor_engine", None) if self._app_state else None
-        if engine and engine.has_asset_rules("index") and self._repo:
+        if index_records and self._repo:
             index_daily_df = self._build_daily(index_records)
             if not index_daily_df.is_empty():
                 use_flush = preferences.get_realtime_index_mode() == "all"
@@ -782,6 +783,11 @@ class QuoteService:
                     for _s in _r.get("symbols", []):
                         if _s and _s not in symbols:
                             symbols.append(_s)
+        # 核心指数始终纳入自选轮询: 否则「指数」页查看非自选/非监控指数时, 指数日K不写盘,
+        # /api/index/daily 只返回昨天 → 前端分时图日期停在昨天。
+        for _s in (preferences.get_realtime_index_symbols() or self.CORE_INDEX_SYMBOLS):
+            if _s and _s not in symbols:
+                symbols.append(_s)
         if not symbols:
             logger.info("自选实时未配置标的, 跳过行情拉取")
             return

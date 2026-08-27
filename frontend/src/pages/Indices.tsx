@@ -175,7 +175,11 @@ export function Indices() {
 
   useEffect(() => {
     if ((!selectedDate || !chartRows.some(r => r.date === selectedDate)) && chartRows.length > 0 && daily.data?.symbol === selectedSymbol) {
-      setSelectedDate(chartRows[chartRows.length - 1].date)
+      // 优先选中"今天"(实时分时), 仅当今天没有日K(周末/未同步)时才回退到最近交易日,
+      // 否则盘中默认选到昨天的日K会导致分时图一直显示昨天。
+      const today = new Date()
+      const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`
+      setSelectedDate(chartRows.some(r => r.date === todayStr) ? todayStr : chartRows[chartRows.length - 1].date)
     }
   }, [chartRows, daily.data?.symbol, selectedDate, selectedSymbol])
   const renderIndexItem = (item: IndexInstrument) => {

@@ -75,6 +75,8 @@ func main() {
 		opRealtime(c, rq.Args)
 	case "instruments":
 		opInstruments(c, rq.Args)
+	case "finance":
+		opFinance(c, rq.Args)
 	default:
 		respond(response{Ok: false, Error: "unknown op: " + rq.Op})
 	}
@@ -428,6 +430,47 @@ func opInstruments(c *tdx.Client, args json.RawMessage) {
 				"asset_type": target,
 			})
 		}
+	}
+	respond(response{Ok: true, Data: rows})
+}
+
+// ---- finance ----
+
+// opFinance 拉取标的流通股本/总股本(用于换手率等计算)。
+// 参数: {codes: ["sz000001", ...]}。单只失败(如非股票/已退市)跳过, 不阻断整批。
+func opFinance(c *tdx.Client, args json.RawMessage) {
+	var a struct {
+		Codes []string `json:"codes"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		respond(response{Ok: false, Error: "finance args: " + err.Error()})
+		return
+	}
+	rows := make([]map[string]any, 0, len(a.Codes))
+	for _, full := range a.Codes {
+		if len(full) != 8 {
+			continue
+		}
+		var ex protocol.Exchange
+		switch full[:2] {
+		case "sh":
+			ex = protocol.ExchangeSH
+		case "sz":
+			ex = protocol.ExchangeSZ
+		case "bj":
+			ex = protocol.ExchangeBJ
+		default:
+			continue
+		}
+		fi, err := c.GetFinanceInfo(ex, full[2:])
+		if err != nil {
+			continue // 单只失败跳过, 不阻断整批
+		}
+		rows = append(rows, map[string]any{
+			"symbol":       full,
+			"float_shares": fi.LiuTongGuBen, // 单位: 股
+			"total_shares": fi.ZongGuBen,    // 单位: 股
+		})
 	}
 	respond(response{Ok: true, Data: rows})
 }
