@@ -529,11 +529,18 @@ class EltdxProvider:
                 quotes = cc.quotes.get_snapshots(list(group))
                 for q in quotes or []:
                     pct = getattr(q, "change_pct", None) or 0.0
+                    last = q.last_price
+                    prev = q.pre_close_price
+                    # 集合竞价/停牌时段现价可能为 0(未出价/无成交): 用昨收兜底现价(交易所惯例),
+                    # 避免 K 线/现价显示为 0; 涨跌幅为 0(视为未成交, 不计涨跌)而非 -100%。
+                    if last is None or float(last) == 0.0:
+                        last = prev
+                        pct = 0.0
                     out.append(
                         {
                             "symbol": _to_symbol(q.full_code),
-                            "last_price": q.last_price,
-                            "prev_close": q.pre_close_price,
+                            "last_price": last,
+                            "prev_close": prev,
                             "open": q.open_price,
                             "high": q.high_price,
                             "low": q.low_price,

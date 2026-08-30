@@ -365,6 +365,11 @@ func opRealtime(c *tdx.Client, args json.RawMessage) {
 		}
 		last := q.Kline.Last.Float64() // 昨收
 		cur := q.Kline.Close.Float64() // 现价
+		// 集合竞价/停牌时段现价可能为 0(未出价/无成交): 用昨收兜底现价(交易所惯例),
+		// 避免 K 线/现价显示为 0; 涨跌幅为 0(视为未成交, 不计涨跌)而非 -100%。
+		if cur == 0.0 && last != 0.0 {
+			cur = last
+		}
 		pct := 0.0
 		if last != 0.0 {
 			pct = (cur - last) / last // 小数制(百分数/100)
