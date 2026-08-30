@@ -57,7 +57,5 @@ backend/.env
 *.log
 
 # ===== 插件本地构建产物/运行缓存 (镜像内会重新编译/生成) =====
-output
-backend/output
 backend/app/plugins/tdxgo/bin
 backend/app/plugins/tdxgo/data
