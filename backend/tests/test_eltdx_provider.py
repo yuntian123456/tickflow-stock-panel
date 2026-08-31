@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sys
 import types
-from datetime import UTC, datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import polars as pl
@@ -16,7 +16,7 @@ import pytest
 
 from app.data_providers.custom import loader as cs_loader
 from app.plugins.eltdx import bridge as eltdx_bridge
-from app.plugins.eltdx.provider import EltdxProvider, _to_symbol, _to_tdx
+from app.plugins.eltdx.provider import _MINUTE_MAX_PAGES, EltdxProvider, _to_symbol, _to_tdx
 
 
 def _bar(time, close, high=None, low=None, volume=100, amount=10000.0):
@@ -29,6 +29,46 @@ def _bar(time, close, high=None, low=None, volume=100, amount=10000.0):
         volume_lots=volume,
         amount=amount,
     )
+
+
+def _gen_minute_bars(n_days: int, start_date, bars_per_day: int = 240) -> list:
+    """生成 n_days 个交易日的 1m 分钟K(北京墙钟 naive), 每个交易日 bars_per_day 根。
+
+    仅用于分页契约测试: 数据最旧在前、严格递增跨多个交易日, 与 provider 的
+    「start 递增向更早翻页」及「bars[0] 为本页最早一根」约定对齐。
+    """
+    out: list = []
+    day = datetime(start_date.year, start_date.month, start_date.day, 9, 30)
+    made = 0
+    while made < n_days:
+        if day.weekday() < 5:
+            for i in range(bars_per_day):
+                out.append(_bar(day + timedelta(minutes=i), close=10.0 + made * 0.01 + i * 0.0001))
+            made += 1
+        day = (day + timedelta(days=1)).replace(hour=9, minute=30)
+    return out
+
+
+def _paged_server(bars: list):
+    """把最旧在前的 bar 列表变成「按分页语义响应」的 bars.get 回调。
+
+    模拟服务端: bars.get(code, start=s, count=c) 返回「从最旧端跳过 s 根后的 c 根」,
+    即 start 递增 → 更早(更旧)的一页; 越过最旧端 → 空页。这正对应
+    provider 的分页终止逻辑(空页 / 本页最早一根早于窗口起点 / 不足一页)。
+    """
+    n = len(bars)
+    calls: list[int] = []
+
+    def fn(code, **kwargs):
+        s = kwargs.get("start", 0)
+        c = kwargs.get("count", 800)
+        calls.append(s)
+        hi = n - s
+        lo = max(0, hi - c)
+        return SimpleNamespace(bars=list(bars[lo:hi]))
+
+    fn.calls = calls
+    return fn
 
 
 class FakeTdxClient:
@@ -52,6 +92,7 @@ class FakeTdxClient:
         codes_all=None,
         kind_log=None,
         xdxr=None,
+        bars_get_fn=None,
     ):
         self._series = series
         self._factors = factors
@@ -61,6 +102,7 @@ class FakeTdxClient:
         self._codes_all = codes_all or []
         self._kind_log = kind_log
         self._xdxr = xdxr or []
+        self._bars_get_fn = bars_get_fn
         self.bars = SimpleNamespace(all=self._bars_all, get=self._bars_get)
         self.quotes = SimpleNamespace(get_snapshots=self._quotes_get_snapshots)
         self.codes = SimpleNamespace(
@@ -92,6 +134,8 @@ class FakeTdxClient:
         self._record_kind(kwargs)
         if self._period_log is not None:
             self._period_log.append(period)
+        if self._bars_get_fn is not None:
+            return self._bars_get_fn(code, **kwargs)
         return self._series
 
     # ---- codes 模块(all_xxx 返回 full_code 字符串, 按前缀分类为互斥三类) ----
@@ -254,18 +298,20 @@ def test_get_minute_period_mapping(fake_eltdx, freq, expected):
     df = provider.get_minute(["000001.SZ"], None, None, freq=freq)
     assert period_log == [expected]
     assert df.columns == ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
-    assert df["datetime"].to_list() == [datetime(2026, 1, 2, 1, 31)]  # 9:31 北京墙钟 → 真实 UTC naive (-8h)
+    assert df["datetime"].to_list() == [datetime(2026, 1, 2, 9, 31)]  # 9:31 北京墙钟 naive(契约口径)
 
 
-def test_get_minute_aware_datetime_normalized(fake_eltdx):
-    """eltdx 返回 UTC 带时区时间戳: 转真实 UTC naive (北京墙钟 -8h)。
+def test_get_minute_beijing_wallclock_naive(fake_eltdx):
+    """eltdx 返回带 +08:00 时区的北京墙钟时间戳: 去 tz 后直接得到北京墙钟 naive。
 
-    与 tickflow from_epoch(ms)(UTC naive)及前端分时 fmtTime +8 还原口径一致。
+    分钟K契约 (CONTRIBUTING §3.3): datetime 必须为北京时间墙钟, 前端不做时区换算。
     """
+    from zoneinfo import ZoneInfo
+    sh = ZoneInfo("Asia/Shanghai")
     series = SimpleNamespace(
         bars=[
-            _bar(datetime(2026, 1, 2, 9, 31, tzinfo=UTC), close=10.0),
-            _bar(datetime(2026, 1, 2, 14, 30, tzinfo=UTC), close=10.5),
+            _bar(datetime(2026, 1, 2, 9, 31, tzinfo=sh), close=10.0),
+            _bar(datetime(2026, 1, 2, 14, 30, tzinfo=sh), close=10.5),
         ]
     )
     fake_eltdx(FakeTdxClient(series=series))
@@ -277,7 +323,7 @@ def test_get_minute_aware_datetime_normalized(fake_eltdx):
         freq="1m",
     )
     assert df["datetime"].dtype == pl.Datetime("us")  # naive, 无时区
-    assert df["datetime"].to_list() == [datetime(2026, 1, 2, 1, 31)]  # 9:31 北京 → 01:31 UTC
+    assert df["datetime"].to_list() == [datetime(2026, 1, 2, 9, 31)]  # 9:31 北京墙钟
 
 
 # ---- realtime ----
@@ -411,3 +457,79 @@ def test_get_realtime_includes_etf_index(fake_eltdx):
     by_symbol = {r["symbol"]: r for r in rows}
     assert by_symbol["000001.SH"]["last_price"] == 3500.0
     assert by_symbol["510300.SH"]["last_price"] == 4.6
+
+
+# ---- 分钟K分页契约: 多页合并、空页终止、页数上限 ----
+#
+# 契约(docs/plugin-development.md「测试要求」第 3 点): 分页需覆盖
+# 「多页合并、空页终止、页数上限」。eltdx bars.get 单次 count 上限 800 根,
+# 窗口跨多交易日时 provider 按 start 递增向更早翻页合并, 行为由 _paged_server 模拟。
+
+
+def test_get_minute_pagination_merges_pages(fake_eltdx):
+    """多页合并: 窗口覆盖超过单页(800根)时, 按 start 分页向更早翻页并合并全部数据。
+
+    7 个交易日 = 1680 根 > 单页 800, 且窗口起点=最早一根(触发不了「已覆盖」提前中断),
+    → 必须翻满 3 页(start=0/800/1600)才能取全窗口。
+    """
+    all_bars = _gen_minute_bars(n_days=7, start_date=datetime(2026, 1, 5))
+    n = len(all_bars)
+    assert n > 800  # 确保跨页
+    server = _paged_server(all_bars)
+    fake_eltdx(FakeTdxClient(bars_get_fn=server))
+    provider = EltdxProvider()
+    df = provider.get_minute(
+        ["000001.SZ"],
+        start_time=all_bars[0].time,
+        end_time=all_bars[-1].time,
+        freq="1m",
+    )
+    assert not df.is_empty()
+    assert [s for s in server.calls] == [0, 800, 1600]  # 确实跨多页合并
+    assert df.height == n  # 合并了全部 7 个交易日, 而非只最近 800 根
+    assert set(df["datetime"].to_list()) == {b.time for b in all_bars}
+
+
+def test_get_minute_pagination_empty_page_terminates(fake_eltdx):
+    """空页终止: start_time 早于全量数据, 翻到最旧端服务端无更早数据 → 空页终止, 不死循环。
+
+    用恰好 2 个满页(1600 根)的数据: 第 3 次请求(start=1600)返回空页触发终止。
+    """
+    all_bars = _gen_minute_bars(n_days=7, start_date=datetime(2026, 1, 5))[:1600]  # 恰好 2 满页
+    server = _paged_server(all_bars)
+    fake_eltdx(FakeTdxClient(bars_get_fn=server))
+    provider = EltdxProvider()
+    df = provider.get_minute(
+        ["000001.SZ"],
+        start_time=datetime(2026, 1, 1),  # 早于最早一根 → 不因「已覆盖窗口」中断
+        end_time=datetime(2026, 1, 31),
+        freq="1m",
+    )
+    assert df.height == 1600  # 两个满页全部合并
+    assert server.calls[-1] == 1600  # 最后一次翻到越过最旧端 → 空页终止
+
+
+def test_get_minute_pagination_cap(fake_eltdx):
+    """页数上限: 服务端异常(永远返回满页、最早一根永不早于窗口起点、永不空页)时,
+    由 _MINUTE_MAX_PAGES 页数上限终止, 避免 while 死循环。
+    """
+    page = _gen_minute_bars(n_days=4, start_date=datetime(2026, 1, 5))  # 960 根, 取前 count 根作满页
+    calls: list[int] = []
+
+    def bad_server(code, **kwargs):
+        c = kwargs.get("count", 800)
+        calls.append(kwargs.get("start", 0))
+        # 始终返回满页 count 根; 最早一根(2026)不早于 start_time(2020) → 永不「已覆盖」,
+        # 且不空页、不足一页 → 只能靠页数上限终止。
+        return SimpleNamespace(bars=list(page[:c]))
+
+    fake_eltdx(FakeTdxClient(bars_get_fn=bad_server))
+    provider = EltdxProvider()
+    df = provider.get_minute(
+        ["000001.SZ"],
+        start_time=datetime(2020, 1, 1),
+        end_time=datetime(2030, 1, 1),
+        freq="1m",
+    )
+    assert len(calls) == _MINUTE_MAX_PAGES  # 恰好翻满上限页, 未死循环
+    assert not df.is_empty()

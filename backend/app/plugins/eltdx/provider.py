@@ -22,7 +22,7 @@ import concurrent.futures as _futures
 import logging
 import threading as _threading
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import polars as pl
@@ -59,6 +59,10 @@ _DAILY_SLACK = 60
 # 分钟K单页条数: eltdx bars.get 单次 count 上限 800(超限抛 ProtocolError 截断)。
 # 1 分钟 240 根/交易日 → 单页约覆盖 3.3 个交易日, 需按 start 分页才能补全历史窗口。
 _MINUTE_PAGE = 800
+# 分钟K分页最大页数: 契约要求「分页必须有页数上限(防 count 异常导致死循环)」。
+# 单页 800 根, 50 页共 40000 根, 约 166 交易日, 远超分钟同步默认窗口(数天);
+# 达到上限说明服务端异常(重复返回满页 / 永不覆盖窗口起点), 记警告而非无限循环。
+_MINUTE_MAX_PAGES = 50
 _MINUTE_CANONICAL = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
 # 每个 period 单交易日分钟K根数 (A股 9:30-11:30 + 13:00-15:00 = 240 分钟)。
 _BARS_PER_DAY = {"1m": 240, "5m": 48, "15m": 16, "30m": 8, "60m": 4}
@@ -195,18 +199,6 @@ def _naive(t) -> datetime:
     return t.replace(tzinfo=None) if t.tzinfo is not None else t
 
 
-def _to_utc_naive(t) -> datetime:
-    """eltdx 分钟时间(北京时间墙钟) → 真实 UTC naive (北京墙钟 - 8h)。
-
-    前端分时组件把 datetime 字符串按真实 UTC 解析并 +8 还原为北京墙钟
-    (见 EChartsIntraday.tsx fmtTime), 与 tickflow 的 from_epoch(ms) 口径一致。
-    eltdx 返回的 bar.time 是带 UTC tzinfo 的北京时间墙钟, 直接 _naive 会得到
-    北京时间(如 09:35), 前端 +8 后变成 17:35 无法映射到 242 个全天刻度 → 曲线全空。
-    故分钟时间须先转真实 UTC naive(01:35) 再给前端。
-    """
-    return _naive(t) - timedelta(hours=8)
-
-
 def _bar_to_daily_row(bar, symbol: str) -> dict:
     """eltdx KlineBar → 内部日K行(不含 datetime, 避免与 date 冲突)。"""
     return {
@@ -224,12 +216,13 @@ def _bar_to_daily_row(bar, symbol: str) -> dict:
 def _bar_to_minute_row(bar, symbol: str) -> dict:
     """eltdx KlineBar → 内部分钟K行。
 
-    datetime 转真实 UTC naive (北京时间墙钟 - 8h, 见 _to_utc_naive), 与
-    tickflow from_epoch(ms) 及前端 +8 还原的口径保持一致。
+    datetime 直接取北京时间墙钟 naive (去 tz), 与分钟K契约一致
+    (CONTRIBUTING §3.3): kline_minute.datetime 必须是北京墙钟, 如 09:35:00。
+    前端分时组件按交易时段时轴映射, 不再做时区换算。
     """
     return {
         "symbol": symbol,
-        "datetime": _to_utc_naive(bar.time),
+        "datetime": _naive(bar.time),
         "open": bar.open,
         "high": bar.high,
         "low": bar.low,
@@ -434,10 +427,11 @@ class EltdxProvider:
             # 全部缺失 → 前端只能看到最近 4 天。按 start 分页向前翻到覆盖窗口起点;
             # start_time 未传(设置页预览)时保持单页 800 根, 避免预览拉全量。
             # 指数需传 kind="index", 否则宽幅字段导致协议解析错位(分钟K缺失)。
+            # 分页契约: 空页终止 + 页数上限(防服务端异常死循环)。
             kind = _kind_for(sym)
             rows: list[dict] = []
             start = 0
-            while True:
+            for _page in range(_MINUTE_MAX_PAGES):
                 count = first_count if start == 0 else _MINUTE_PAGE
                 series = c.bars.get(
                     _to_tdx(sym), period=period, adjust="none",
@@ -446,24 +440,29 @@ class EltdxProvider:
                 )
                 bars = series.bars or []
                 if not bars:
-                    break
+                    break  # 空页终止: 服务端无更早数据
                 rows.extend(_bar_to_minute_row(b, sym) for b in bars)
                 if start_time is None or _naive(bars[0].time) < _naive(start_time):
                     break  # 预览模式 / 本页最早一根已早于窗口起点 → 覆盖完成
                 if len(bars) < count:
-                    break  # 服务器无更早数据
+                    break  # 服务端无更早数据(不足一页)
                 start += count
+            else:
+                logger.warning(
+                    "eltdx %s 分钟K分页达到上限 %d 页, 可能未覆盖完整窗口",
+                    sym, _MINUTE_MAX_PAGES,
+                )
             df = pl.DataFrame(rows) if rows else pl.DataFrame()
             if df.is_empty():
                 return None
             df = df.select(_MINUTE_CANONICAL)
-            # 调用方 start_time/end_time 为北京墙钟 naive(见 fetch_minute_single /
-            # get_minute_batch 的 9:25/15:05 构造), 而本行 datetime 已是真实 UTC
-            # naive, 过滤边界须同步 -8h 才能正确比较。
+            # 调用方 start_time/end_time 为北京墙钟 (fetch_minute_single 的 9:25/15:05 带
+            # +08:00 时区, sync 为 naive), 本行 datetime 已是北京墙钟 naive, 过滤边界
+            # 统一用 _naive 取北京墙钟即可直接比较。
             if start_time:
-                df = df.filter(pl.col("datetime") >= _to_utc_naive(start_time))
+                df = df.filter(pl.col("datetime") >= _naive(start_time))
             if end_time:
-                df = df.filter(pl.col("datetime") <= _to_utc_naive(end_time))
+                df = df.filter(pl.col("datetime") <= _naive(end_time))
             return df if not df.is_empty() else None
 
         frames = self._run_concurrent(symbols, fetch_one, on_chunk_done)
