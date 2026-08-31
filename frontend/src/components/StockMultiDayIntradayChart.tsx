@@ -85,21 +85,24 @@ export function StockMultiDayIntradayChart({
   const queryError = sessions.length === 0 ? history.error ?? latest.error : null
   const isIndex = history.data?.asset_type === 'index' || latest.data?.asset_type === 'index'
   const missingDays = Math.max(0, days - sessions.length)
-  const showCoverage = !history.isPlaceholderData && sessions.length > 0 && missingDays > 0 && !isIndex
+  // 补齐提示条不因 history 处于 placeholder(切换档位/重挂载的瞬时态)而隐藏:
+  // 只要本地数据不足目标天数, 就必须给出「重试补齐」入口, 否则用户只能看到
+  // 不完整数据而无处拉取历史分时。
+  const showCoverage = sessions.length > 0 && missingDays > 0 && !isIndex
 
   // 自动补齐: 数据不足且非指数时, 自动触发同步
   // 用 ref 记录已触发的 symbol:days, 避免重复
   const autoSyncRef = useRef<string | null>(null)
   useEffect(() => {
     // 后端没运行时 history 会 error, 此时 missingDays 计算无意义, 跳过
-    if (history.error || history.isPlaceholderData || loading || isIndex || sessions.length >= days) return
+    if (history.error || loading || isIndex || sessions.length >= days) return
     if (syncMinute.isPending) return
 
     const key = `${symbol}:${days}`
     if (autoSyncRef.current === key) return  // 本组合已触发过
     autoSyncRef.current = key
     syncMinute.mutate()
-  }, [symbol, days, sessions.length, loading, isIndex, history.error, history.isPlaceholderData, syncMinute.isPending])
+  }, [symbol, days, sessions.length, loading, isIndex, history.error, syncMinute.isPending])
 
   const chartHeight = Math.max(260, height - (showCoverage || syncMinute.isPending ? 32 : 0))
 
