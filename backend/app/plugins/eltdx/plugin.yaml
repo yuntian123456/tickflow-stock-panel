@@ -8,6 +8,6 @@ display_name: "通达信行情（eltdx）"
 runtime: python
 entry: app.plugins.eltdx.provider:EltdxProvider
 check: app.plugins.eltdx.bridge:availability
-datasets: [daily, adj_factor, minute, realtime]
-description: "通达信 7709 行情协议(纯 Python 客户端), 提供 A股/ETF/指数 日K、分钟K(1m~60m)、除权因子、实时全市场快照与标的维表。数据未授权, 仅限个人学习研究。"
+datasets: [daily, adj_factor, minute, realtime, full_minute]
+description: "通达信 7709 行情协议(纯 Python 客户端), 提供 A股/ETF/指数 日K、分钟K(1m~60m)、除权因子、实时全市场快照、全量分钟(当日修复轮)与标的维表。数据未授权, 仅限个人学习研究。"
 install_hint: "Docker 默认打包;开发模式: cd backend && pip install eltdx"

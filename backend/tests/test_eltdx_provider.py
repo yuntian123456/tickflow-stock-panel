@@ -93,6 +93,7 @@ class FakeTdxClient:
         kind_log=None,
         xdxr=None,
         bars_get_fn=None,
+        series_by_adjust=None,
     ):
         self._series = series
         self._factors = factors
@@ -103,7 +104,9 @@ class FakeTdxClient:
         self._kind_log = kind_log
         self._xdxr = xdxr or []
         self._bars_get_fn = bars_get_fn
-        self.bars = SimpleNamespace(all=self._bars_all, get=self._bars_get)
+        self._series_by_adjust = series_by_adjust
+        # eltdx >=3.1.0: bars.all 并入 bars.get(..., all_pages=True)
+        self.bars = SimpleNamespace(get=self._bars_get)
         self.quotes = SimpleNamespace(get_snapshots=self._quotes_get_snapshots)
         self.codes = SimpleNamespace(
             all_a_shares=self.codes_all_a_shares,
@@ -126,14 +129,13 @@ class FakeTdxClient:
         if self._kind_log is not None:
             self._kind_log.append(kwargs.get("kind"))
 
-    def _bars_all(self, code, **kwargs):
-        self._record_kind(kwargs)
-        return self._series
-
     def _bars_get(self, code, period="day", **kwargs):
         self._record_kind(kwargs)
         if self._period_log is not None:
             self._period_log.append(period)
+        adjust = kwargs.get("adjust")
+        if self._series_by_adjust is not None and adjust in self._series_by_adjust:
+            return self._series_by_adjust[adjust]
         if self._bars_get_fn is not None:
             return self._bars_get_fn(code, **kwargs)
         return self._series
@@ -187,7 +189,7 @@ def test_plugin_discovered_in_loader():
     manifest = plugins.get("eltdx")
     assert manifest is not None
     assert manifest["runtime"] == "python"
-    assert manifest["datasets"] == ["daily", "adj_factor", "minute", "realtime"]
+    assert manifest["datasets"] == ["daily", "adj_factor", "minute", "realtime", "full_minute"]
     assert "financial" not in manifest["datasets"]
 
 
@@ -261,26 +263,27 @@ def test_get_daily_empty():
 
 
 def test_get_adj_factors(fake_eltdx):
-    """eltdx qfq_factor 是每日累积前复权系数, 应转换为除权事件因子。
+    """eltdx >=3.1.0 移除 helpers.factors/xdxr: 主路径用服务端 qfq/raw 比值推导事件因子。
 
-    事件因子 ex(D) = qfq(D)/qfq(D-1), 记在跳变日, 仅保留 |ex-1|>1e-9 的除权日;
-    序列首日无前值跳过, 无跳变的日常数(1.0)不产出因子行。
+    模拟一次 10送10 除权: 除权日 raw 收盘减半(10→5), 服务端 qfq 前复权后仍为 10。
+    cum = qfq/raw: 1.0 → 2.0, ex(D) = cum(D)/cum(D-1) = 2.0 (记在除权日)。
     """
-    factors = SimpleNamespace(
-        items=[
-            SimpleNamespace(time=datetime(2026, 1, 2, 15, 0), qfq_factor=1.0),  # 首日: 跳过
-            SimpleNamespace(time=datetime(2026, 2, 3, 15, 0), qfq_factor=2.0),  # ex=2.0
-            SimpleNamespace(time=datetime(2026, 3, 4, 15, 0), qfq_factor=2.0),  # 无跳变: 滤除
-            SimpleNamespace(time=datetime(2026, 4, 5, 15, 0), qfq_factor=1.5),  # ex=0.75
-        ]
-    )
-    fake_eltdx(FakeTdxClient(factors=factors))
+    def _mk(closes):
+        return SimpleNamespace(
+            bars=[_bar(datetime.fromisoformat(f"{d} 15:00"), close=c) for d, c in closes]
+        )
+
+    series_by_adjust = {
+        "none": _mk([("2026-01-02", 10.0), ("2026-01-05", 5.0)]),
+        "qfq": _mk([("2026-01-02", 10.0), ("2026-01-05", 10.0)]),
+    }
+    fake_eltdx(FakeTdxClient(series_by_adjust=series_by_adjust))
     provider = EltdxProvider()
     df = provider.get_adj_factors(["000001.SZ"], None, None)
     assert df.columns == ["symbol", "trade_date", "ex_factor"]
-    assert df["symbol"].to_list() == ["000001.SZ", "000001.SZ"]
-    assert df["trade_date"].to_list() == [datetime(2026, 2, 3).date(), datetime(2026, 4, 5).date()]
-    assert df["ex_factor"].to_list() == [2.0, 0.75]
+    assert df["symbol"].to_list() == ["000001.SZ"]
+    assert df["trade_date"].to_list() == [datetime(2026, 1, 5).date()]
+    assert df["ex_factor"].to_list() == [2.0]
 
 
 # ---- minute ----
@@ -324,6 +327,33 @@ def test_get_minute_beijing_wallclock_naive(fake_eltdx):
     )
     assert df["datetime"].dtype == pl.Datetime("us")  # naive, 无时区
     assert df["datetime"].to_list() == [datetime(2026, 1, 2, 9, 31)]  # 9:31 北京墙钟
+
+
+def test_get_intraday_batch_full_minute(fake_eltdx):
+    """full_minute 数据集修复轮: 当日窗口批量分钟K, canonical 8 列北京墙钟 naive。
+
+    窗口 = 当日 0 点 ~ 当前(北京墙钟), get_minute 过滤边界后仅保留当日分钟。
+    """
+    from app.market_time import cn_now
+
+    now = cn_now().replace(tzinfo=None)
+    d = now.date()
+    yesterday = (now - timedelta(days=1)).date()
+    series = SimpleNamespace(
+        bars=[
+            _bar(datetime(d.year, d.month, d.day, 9, 31), close=10.0),
+            _bar(datetime(d.year, d.month, d.day, 14, 30), close=10.5),
+            _bar(datetime(yesterday.year, yesterday.month, yesterday.day, 9, 31), close=9.0),  # 昨日 → 窗口外滤除
+        ]
+    )
+    fake_eltdx(FakeTdxClient(series=series))
+    provider = EltdxProvider()
+    df = provider.get_intraday_batch(["000001.SZ"])
+    assert df.columns == ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
+    assert df["symbol"].to_list() == ["000001.SZ", "000001.SZ"]
+    assert df["datetime"].dtype == pl.Datetime("us")  # 北京墙钟 naive
+    assert df["close"].to_list() == [10.0, 10.5]
+    # 未实现 get_intraday_latest → 服务降级为仅修复轮(契约允许)
 
 
 # ---- realtime ----

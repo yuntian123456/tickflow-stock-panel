@@ -29,12 +29,14 @@ import polars as pl
 
 from app.config import settings
 from app.data_providers.normalizer import normalize_adj_factors, normalize_daily
+from app.market_time import cn_now
 from app.tickflow.rate_limits import chunked
 
 logger = logging.getLogger(__name__)
 
-# eltdx 支持的数据集(financial 不支持 → 不声明, 自动回退 tickflow)
-_DATASETS = ("daily", "adj_factor", "minute", "realtime")
+# eltdx 支持的数据集(financial 不支持 → 不声明, 自动回退 tickflow)。
+# full_minute: 全量分钟修复轮(当日全市场批量分钟), 见 get_intraday_batch。
+_DATASETS = ("daily", "adj_factor", "minute", "realtime", "full_minute")
 
 _EXCHANGE_TO_TDX = {"SH": "sh", "SZ": "sz", "BJ": "bj"}
 _TDX_TO_EXCHANGE = {v: k for k, v in _EXCHANGE_TO_TDX.items()}
@@ -79,32 +81,14 @@ def _minute_count(start_time, end_time, period: str) -> int:
     return max(bars_per_day, trading_days * bars_per_day + bars_per_day)
 
 
-def _ex_events_from_qfq_items(items, symbol: str) -> list[dict]:
-    """把「每日累积前复权系数」序列转成事件因子: ex(D) = qfq(D)/qfq(D-1), 仅保留跳变日。
-
-    items 为 FactorRecord/FactorItem, 含 qfq_factor(每日累积前复权系数, 最新日=1.0)
-    与 time。pipeline 期望 ex_factor 为每次除权事件的 pre/post 比值(非累积系数)。
-    """
-    rows: list[dict] = []
-    prev_qfq = None
-    for item in sorted(items, key=lambda it: it.time):
-        qfq = float(getattr(item, "qfq_factor", 1.0))
-        if prev_qfq is not None and prev_qfq != 0.0:
-            ex = qfq / prev_qfq
-            if abs(ex - 1.0) > 1e-9:
-                rows.append({"symbol": symbol, "trade_date": item.time.date(), "ex_factor": ex})
-        prev_qfq = qfq
-    return rows
-
-
 def _ex_events_from_server_qfq(c, symbol: str, window_days: int | None) -> list[dict]:
-    """数据源未登记股本事件(如 ETF 份额拆分不在 xdxr/股本变迁中)时的兜底推导。
+    """主路径: 用服务端前复权K线(qfq)与不复权K线的比值推导事件因子。
 
-    用服务端前复权K线(qfq)与不复权K线的比值推导事件因子:
+    (eltdx >=3.1.0 移除 helpers.factors/xdxr 与 equity.build_factor_response,
+    服务端 qfq 是通达信权威前复权, 含现金分红, 能覆盖 xdxr 未登记的拆分。)
       cum(D) = qfq_close(D) / raw_close(D)   (累积前复权比值, 拆分为 1/3 → 1.0)
       ex(D)  = cum(D) / cum(D-1)             (拆分日 ex≈3.0)
-    服务端 qfq 是通达信权威前复权, 能覆盖 xdxr 未登记的拆分。阈值 0.01 过滤
-    qfq/raw 的日内舍入漂移(~0.2%), 保留真实拆分/分红(通常>1%)。
+    阈值 0.01 过滤 qfq/raw 的日内舍入漂移(~0.2%), 保留真实拆分/分红(通常>1%)。
     """
     count = min(window_days + _DAILY_SLACK, 800) if window_days is not None else 800
     kind = _kind_for(symbol)
@@ -335,7 +319,10 @@ class EltdxProvider:
                     kind=kind,
                 )
             else:
-                series = c.bars.all(_to_tdx(sym), period="day", adjust="none", kind=kind)
+                # eltdx >=3.1.0: bars.all 并入 bars.get(..., all_pages=True)
+                series = c.bars.get(
+                    _to_tdx(sym), period="day", adjust="none", kind=kind, all_pages=True,
+                )
             rows = [_bar_to_daily_row(b, sym) for b in (series.bars or [])]
             df = normalize_daily(rows, source=self.name)
             if df.is_empty():
@@ -362,36 +349,17 @@ class EltdxProvider:
             return pl.DataFrame()
 
         def fetch_one(c, sym) -> pl.DataFrame | None:
-            # 指数自身不发生分红/送转除权, 不产生 ex_factor; 且 helpers.factors
-            # 内部 bars.all 不带 kind(指数会解析错位), 故指数直接跳过。
+            # 指数自身不发生分红/送转除权, 不产生 ex_factor; 且服务端复权推导
+            # 不带 kind(指数会解析错位), 故指数直接跳过。
             if _is_index_symbol(sym):
                 return None
-            # 主路径: 用数据源权威复权因子序列。小窗口走单次 bars.get + build_factor_response
-            # (快, ~0.07s/只; 依赖 xdxr 事件), 大窗口/未传窗口回退 helpers.factors 全量。
+            # eltdx >=3.1.0 移除 helpers.factors/xdxr 与 equity.build_factor_response,
+            # 统一改用服务端前复权(qfq)与不复权K线比值推导事件因子(含现金分红, 权威):
+            # ex(D) = cum(D)/cum(D-1), cum = qfq_close/raw_close。小窗口用单页 bars.get。
             window_days = None
             if start_time and end_time:
                 window_days = max(0, (end_time - start_time).days)
-            if window_days is not None and window_days + _DAILY_SLACK <= _MINUTE_PAGE:
-                from eltdx.equity import build_factor_response
-
-                series = c.bars.get(
-                    _to_tdx(sym), period="day", adjust="none",
-                    count=window_days + _DAILY_SLACK,
-                    kind=_kind_for(sym),
-                )
-                factors = build_factor_response(series, c.helpers.xdxr(_to_tdx(sym)))
-                items = getattr(factors, "items", [])
-            else:
-                factors = c.helpers.factors(_to_tdx(sym))
-                items = getattr(factors, "items", [])
-            # eltdx 的 qfq_factor 是每日累积前复权系数(最新日=1.0), 并非除权事件因子;
-            # pipeline 期望 ex_factor = 每次除权事件的 pre/post 比值(个股级,非累积)。
-            # 转换: ex(D) = qfq(D)/qfq(D-1), 记在跳变日(D), 仅保留 |ex-1|>1e-9 的除权日。
-            rows = _ex_events_from_qfq_items(items, sym)
-            # 兜底: 主路径无事件(如 ETF 份额拆分不在 xdxr/股本变迁中) → 从服务端
-            # 前复权K线(qfq)与不复权比值推导, 覆盖通达信未登记为股本事件的拆分。
-            if not rows:
-                rows = _ex_events_from_server_qfq(c, sym, window_days)
+            rows = _ex_events_from_server_qfq(c, sym, window_days)
             if not rows:
                 return None
             df = normalize_adj_factors(rows, source=self.name)
@@ -467,6 +435,30 @@ class EltdxProvider:
 
         frames = self._run_concurrent(symbols, fetch_one, on_chunk_done)
         return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+
+    # ---- full_minute (全量分钟修复轮) ----
+    def get_intraday_batch(
+        self,
+        symbols: list[str],
+        count: int = 300,  # noqa: ARG002 - 与插件契约对齐; 当日窗口单页(<=800)即覆盖
+        asset_type: str = "stock",
+    ) -> pl.DataFrame:
+        """全量分钟修复轮: 当日窗口全市场批量分钟K (canonical 8 列同 get_minute)。
+
+        声明 full_minute 数据集后, 被 minute_refresh 在冷启动/覆盖断档/连续空轮时调用
+        (docs/plugin-development.md)。复用 get_minute 的当日窗口单页拉取(每只 1 次
+        bars.get)与 _run_concurrent 并发; 返回北京墙钟 naive, 时区守卫由调用方
+        fetch_intraday_custom_batch 统一执行。未实现 get_intraday_latest → 服务
+        自动降级为仅修复轮(节奏下限 60s), 避免全市场分钟增量请求压垮 TDX 服务器。
+        """
+        if not symbols:
+            return pl.DataFrame()
+        now = cn_now().replace(tzinfo=None)
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return self.get_minute(
+            symbols, start_time=start, end_time=now,
+            asset_type=asset_type, freq="1m",
+        )
 
     # ---- realtime ----
     def _read_managed_symbols(self, dirname: str) -> set[str]:
@@ -573,6 +565,9 @@ class EltdxProvider:
         if dataset == "minute":
             df = self.get_minute(symbols, None, None)
             return self._preview("minute", df)
+        if dataset == "full_minute":
+            df = self.get_intraday_batch(symbols)
+            return self._preview("full_minute", df)
         if dataset == "realtime":
             rows = self.get_realtime()
             head = rows[:5]
