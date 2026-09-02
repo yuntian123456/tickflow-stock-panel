@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Download, Loader2, RefreshCw } from 'lucide-react'
 import { api, type MinuteKlineSession } from '@/lib/api'
-import { QK } from '@/lib/queryKeys'
+import { klineMinuteQueryOptions, klineMinuteRangeQueryOptions } from '@/lib/kline'
 import { toast } from '@/components/Toast'
 import { EChartsMultiDayIntraday } from '@/components/EChartsMultiDayIntraday'
 
@@ -29,16 +29,12 @@ export function StockMultiDayIntradayChart({
 }: Props) {
   const queryClient = useQueryClient()
   const history = useQuery({
-    queryKey: QK.klineMinuteRange(symbol, days),
-    queryFn: () => api.klineMinuteRange(symbol, days),
+    ...klineMinuteRangeQueryOptions(symbol, days),
     enabled: !!symbol,
-    placeholderData: (previous, previousQuery) =>
-      previousQuery?.queryKey[1] === symbol ? previous : undefined,
   })
   const latest = useQuery({
-    queryKey: QK.klineMinute(symbol, ''),
     // live: 当日盘中直接实时拉取, 不被分钟增量落盘的本地分区(≥60s一轮)拖慢
-    queryFn: () => api.klineMinute(symbol, undefined, true),
+    ...klineMinuteQueryOptions(symbol, undefined, true),
     enabled: !!symbol,
     refetchInterval: refetchIntervalMs,
   })
@@ -72,6 +68,8 @@ export function StockMultiDayIntradayChart({
       ])
     },
     onError: (e: Error) => {
+      // 补齐失败时清空防重标记, 允许下次打开/切回该股时再次自动补齐
+      autoSyncRef.current = null
       const msg = e.message || ''
       if (msg.includes('403') || msg.includes('Pro')) {
         toast('分钟K(批量)数据不可用', 'error')
@@ -84,25 +82,40 @@ export function StockMultiDayIntradayChart({
   const loading = sessions.length === 0 && (history.isLoading || latest.isLoading)
   const queryError = sessions.length === 0 ? history.error ?? latest.error : null
   const isIndex = history.data?.asset_type === 'index' || latest.data?.asset_type === 'index'
-  const missingDays = Math.max(0, days - sessions.length)
-  // 补齐提示条不因 history 处于 placeholder(切换档位/重挂载的瞬时态)而隐藏:
-  // 只要本地数据不足目标天数, 就必须给出「重试补齐」入口, 否则用户只能看到
-  // 不完整数据而无处拉取历史分时。
+  // 补齐判断基于「本地已落库的交易日」(history), 而不是合并当天实时(latest)后的 sessions:
+  // 当天分时由实时接口提供、盘中未必落盘, 若把它计入会让 sessions.length 被撑到 days,
+  // 误判「数据已够」而不显示补齐入口 —— 这正是「只有 4 个完整交易日却没有任何横条/按钮」的根因。
+  const localSessions = history.data?.sessions ?? []
+  const missingDays = Math.max(0, days - localSessions.length)
   const showCoverage = sessions.length > 0 && missingDays > 0 && !isIndex
 
-  // 自动补齐: 数据不足且非指数时, 自动触发同步
-  // 用 ref 记录已触发的 symbol:days, 避免重复
+  // 自动补齐: 数据不足且非指数时, 自动触发同步。
+  // ref 记录已触发过的 symbol:days 作为防重; 关键点是「只在补齐有效期内防重」:
+  //   - 弹窗关闭(symbol 为空)或切换到新标的时清空防重, 保证每次打开/切回该股
+  //     都会重新评估一次补齐(此前「有时补有时不补」不稳定的根因);
+  //   - 同一标的同一档位在补齐结束后仍保留标记, 避免数据天然不足(停牌/次新)时死循环。
   const autoSyncRef = useRef<string | null>(null)
   useEffect(() => {
+    // symbol 为空(弹窗关闭态): 清空防重并跳过, 避免向后端发 symbol=null 的补齐请求
+    if (!symbol) {
+      autoSyncRef.current = null
+      return
+    }
+    // 切到新标的时清空上次防重标记
+    const prev = autoSyncRef.current
+    if (prev && prev.split(':')[0] !== symbol) {
+      autoSyncRef.current = null
+    }
+
     // 后端没运行时 history 会 error, 此时 missingDays 计算无意义, 跳过
-    if (history.error || loading || isIndex || sessions.length >= days) return
+    if (history.error || loading || isIndex || localSessions.length >= days) return
     if (syncMinute.isPending) return
 
     const key = `${symbol}:${days}`
     if (autoSyncRef.current === key) return  // 本组合已触发过
     autoSyncRef.current = key
     syncMinute.mutate()
-  }, [symbol, days, sessions.length, loading, isIndex, history.error, syncMinute.isPending])
+  }, [symbol, days, sessions.length, localSessions.length, loading, isIndex, history.error, syncMinute.isPending])
 
   const chartHeight = Math.max(260, height - (showCoverage || syncMinute.isPending ? 32 : 0))
 
@@ -169,9 +182,9 @@ export function StockMultiDayIntradayChart({
               正在补齐最近 {days} 日分时数据…
             </span>
           ) : syncMinute.isError ? (
-            <span className="truncate text-muted">当前 {sessions.length} 日，目标 {days} 日 — 补齐失败</span>
+            <span className="truncate text-muted">当前 {localSessions.length} 日，目标 {days} 日 — 补齐失败</span>
           ) : (
-            <span className="truncate text-muted">当前 {sessions.length} 个交易日数据，目标 {days} 日</span>
+            <span className="truncate text-muted">当前 {localSessions.length} 个交易日数据，目标 {days} 日</span>
           )}
           {!syncMinute.isPending && (
             <button
