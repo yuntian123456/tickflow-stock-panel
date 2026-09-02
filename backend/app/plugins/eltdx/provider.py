@@ -5,15 +5,15 @@
 方法签名对齐 custom.GenericHTTPProvider(service 分流点按这套签名调用),
 因此注入 custom loader 注册表后, 各 service 无需改动即可路由到本 provider。
 
-数据集: daily / adj_factor / minute / realtime + instruments(标的维表)。
+数据集: daily / adj_factor / minute / realtime / full_minute + instruments(标的维表)。
 financial 未声明: financial_sync 直连 TickFlow SDK, 不走 provider 抽象。
 
-口径注意(与 TickFlow 数据核对):
+口径注意(与项目内部契约核对):
 - realtime 的 change_pct 上游为百分数(如 3.66), 本 provider 转小数制(0.0366)。
-- volume 单位为「手」(eltdx volume_lots / total_hand), 与 TickFlow 口径可能不同。
-- eltdx 的 qfq_factor 是**每日累积前复权系数**(最新日=1.0), 而 pipeline 期望
-  ex_factor 为**每次除权事件的 pre/post 比值**(个股级, 非累积)。故 get_adj_factors
-  先把每日系数序列转成事件因子: ex(D) = qfq(D)/qfq(D-1), 仅保留跳变日。
+- volume 单位为「手」(eltdx volume_lots / total_hand), 与项目内部契约一致
+  (fuyao 也是把上游股→手, quote_service 按手计成交量)。
+- get_adj_factors: eltdx >=3.1.0 移除 helpers.factors/xdxr, 改用服务端
+  前复权(qfq)与不复权K线比值推导事件因子 ex(D) = cum(D)/cum(D-1)。
 """
 
 from __future__ import annotations
@@ -102,7 +102,7 @@ def _ex_events_from_server_qfq(c, symbol: str, window_days: int | None) -> list[
     try:
         raw = _closes("none")
         qfq = _closes("qfq")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("eltdx %s 服务端复权推导失败: %s", symbol, e)
         return []
     rows: list[dict] = []
@@ -279,7 +279,7 @@ class EltdxProvider:
                         row = fetch_one(c, sym)
                         if row is not None:
                             out.append(row)
-                    except Exception as e:  # noqa: BLE001
+                    except Exception as e:
                         logger.warning("eltdx %s 拉取失败: %s", sym, e)
                     tick()
             return out
@@ -440,7 +440,7 @@ class EltdxProvider:
     def get_intraday_batch(
         self,
         symbols: list[str],
-        count: int = 300,  # noqa: ARG002 - 与插件契约对齐; 当日窗口单页(<=800)即覆盖
+        count: int = 300,  # 契约签名要求; 当日窗口单页(<=800)即覆盖, 无需分批
         asset_type: str = "stock",
     ) -> pl.DataFrame:
         """全量分钟修复轮: 当日窗口全市场批量分钟K (canonical 8 列同 get_minute)。
@@ -479,7 +479,7 @@ class EltdxProvider:
                 df = pl.read_parquet(p, columns=["symbol"])
                 if not df.is_empty():
                     out = set(df["symbol"].cast(pl.Utf8).to_list())
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("eltdx 读取 %s 受管集合失败: %s", dirname, e)
             out = set()
         self._managed_cache[dirname] = out
@@ -527,6 +527,12 @@ class EltdxProvider:
                     if last is None or float(last) == 0.0:
                         last = prev
                         pct = 0.0
+                    # change_amount: 涨跌额(元), 确定性派生, 采纳契约建议字段。
+                    # 停牌(last 兜底为 prev)时 change=0, 与 change_pct=0 一致。
+                    change = (
+                        float(last) - float(prev)
+                        if last is not None and prev is not None else None
+                    )
                     out.append(
                         {
                             "symbol": _to_symbol(q.full_code),
@@ -538,6 +544,7 @@ class EltdxProvider:
                             "volume": q.total_hand,  # 单位: 手
                             "amount": getattr(q, "amount", None),
                             "change_pct": float(pct) / 100.0,  # 百分数 → 小数制
+                            "change_amount": change,
                         }
                     )
                 return out
@@ -645,7 +652,7 @@ class EltdxProvider:
         for chunk in chunked(full_codes, _FINANCE_BATCH):
             try:
                 batch = c.corporate.finance_batch(list(chunk), fields=["流通股本", "总股本"])
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.warning("eltdx finance_batch 失败(跳过该批): %s", e)
                 continue
             for rec in batch or []:

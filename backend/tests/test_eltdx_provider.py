@@ -393,8 +393,10 @@ def test_get_realtime(fake_eltdx):
     assert rows[0]["symbol"] == "000001.SZ"
     assert rows[0]["last_price"] == 12.0
     assert rows[0]["change_pct"] == 0.20  # 百分数(20%) → 小数制(0.20)
+    assert rows[0]["change_amount"] == 2.0  # 涨跌额 = last - prev
     assert rows[1]["symbol"] == "600000.SH"
     assert rows[1]["change_pct"] == -0.005
+    assert rows[1]["change_amount"] == 0.0  # 平盘: last == prev
 
 
 # ---- instruments ----
