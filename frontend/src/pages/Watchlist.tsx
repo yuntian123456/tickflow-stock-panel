@@ -3,16 +3,17 @@ import { useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Trash2, RefreshCw, Star, X, Search, LayoutGrid, List, Rows3, BarChart3, Settings2, Plus, Check, Filter, Eye, EyeOff, Minus, ChevronsUp, Clock, RotateCcw, ImagePlus, FolderOpen, FolderMinus, FolderPlus } from 'lucide-react'
+import { Trash2, RefreshCw, Star, X, Search, LayoutGrid, List, Rows3, BarChart3, Settings2, Plus, Check, Filter, Eye, EyeOff, Minus, ChevronsUp, Clock, RotateCcw, FileUp, FolderOpen, FolderMinus, FolderPlus } from 'lucide-react'
 import { api, type KlineRow, type MinuteKlineRow, type WatchlistGroup, type WatchlistGroupColor } from '@/lib/api'
 import { fetchMinuteBatchIncremental } from '@/lib/minuteBatchIncremental'
 import { QK } from '@/lib/queryKeys'
 import { storage } from '@/lib/storage'
 import { fmtPrice, fmtPct, fmtBigNum, priceColorClass, formatExtNumber } from '@/lib/format'
+import { cn } from '@/lib/cn'
 import { computeGroupPcts, loadGroupStatsConfig, type GroupStatsConfigPatch } from '@/lib/watchlistGroupStats'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
-import { StockPreviewDialog } from '@/components/StockPreviewDialog'
+import { StockPreviewDialog, toNavItems, type NavItem } from '@/components/StockPreviewDialog'
 import {
   DimensionMembersDialog,
   dimensionKindForSourceField,
@@ -31,7 +32,6 @@ import { ExtensionSlot } from '@/extensions/ExtensionSlot'
 
 // 分时列开放排序 (StockDataTable 实例级白名单; 表头眼睛/刷新按钮已 stopPropagation)
 const INTRADAY_SORTABLE_KEYS = new Set(['intraday'])
-import { getOcrInstallHint } from '@/lib/ocrInstallHint'
 import { ColumnCustomizer } from '@/components/ColumnCustomizer'
 import { StockDataTable } from '@/components/stock-table/StockDataTable'
 import { VIRTUAL_LIST_THRESHOLD, useParentScroll } from '@/components/virtual-list/useParentScroll'
@@ -468,6 +468,7 @@ const StockCard = React.memo(function StockCard({
   onToggleExpand,
   onDimensionClick,
   isMonitored,
+  active,
   groups,
   onToggleMember,
   groupChangePending,
@@ -485,6 +486,8 @@ const StockCard = React.memo(function StockCard({
   onToggleExpand: (key: string) => void
   onDimensionClick: (target: DimensionMembersTarget) => void
   isMonitored?: boolean
+  /** 正在 K 线弹窗预览中 → 高亮卡片 */
+  active?: boolean
   groups: WatchlistGroup[]
   onToggleMember: (symbol: string, groupId: string, member: boolean) => void
   groupChangePending: boolean
@@ -510,7 +513,7 @@ const StockCard = React.memo(function StockCard({
 
   return (
     <div
-      className={`relative rounded-lg border border-border bg-surface hover:border-border/80 transition-all duration-200 group cursor-pointer overflow-hidden ${bgGlow}`}
+      className={`relative rounded-lg border border-border bg-surface hover:border-border/80 transition-all duration-200 group cursor-pointer overflow-hidden ${bgGlow} ${active ? 'ring-2 ring-accent/60' : ''}`}
       onClick={() => onPreview(r.symbol, name ?? '')}
     >
       {/* 左侧彩色指示条 */}
@@ -677,33 +680,12 @@ export function Watchlist() {
     const g = (searchParams.get('group') as WatchlistGroupFilter | null) ?? 'all'
     setSelectedGroup(g)
   }, [searchParams])
-  const [ocrAvailable, setOcrAvailable] = useState<boolean | null>(null)
-  const [ocrInstallHint, setOcrInstallHint] = useState('')
   const columnsLoaded = useRef(false)
 
   useEffect(() => {
     if (columnsLoaded.current) return
     columnsLoaded.current = true
     loadColumnConfig().then(setColumns)
-  }, [])
-
-  useEffect(() => {
-    let cancelled = false
-    void api.watchlistOcrStatus().then(
-      res => {
-        if (cancelled) return
-        setOcrAvailable(res.available)
-        if (!res.available) setOcrInstallHint(getOcrInstallHint())
-      },
-      () => {
-        if (cancelled) return
-        setOcrAvailable(false)
-        setOcrInstallHint(getOcrInstallHint())
-      },
-    )
-    return () => {
-      cancelled = true
-    }
   }, [])
 
   const handleColumnsChange = useCallback((next: ColumnConfig[]) => {
@@ -776,11 +758,14 @@ export function Watchlist() {
   }, [])
   const [previewSymbol, setPreviewSymbol] = useState<string | null>(null)
   const [previewName, setPreviewName] = useState<string>('')
+  // 切股导航: 默认用 previewNavItems(自选列表); 从成分弹窗打开时用成分列表覆盖
+  const [previewNavList, setPreviewNavList] = useState<NavItem[]>([])
   const [dimensionTarget, setDimensionTarget] = useState<DimensionMembersTarget | null>(null)
   const [expandedCells, setExpandedCells] = useState<Set<string>>(new Set())
   const closePreview = useCallback(() => {
     setPreviewSymbol(null)
     setPreviewName('')
+    setPreviewNavList([])
   }, [])
 
   const handleToggleExpand = useCallback((cellKey: string) => {
@@ -1108,9 +1093,6 @@ export function Watchlist() {
     if (selectedGroup === 'ungrouped') return rowsWithGroup.filter(row => row.group_ids.length === 0)
     return rowsWithGroup.filter(row => row.group_ids.includes(selectedGroup))
   }, [groupBySymbol, rows, selectedGroup])
-  const activeGroup = activeGroupId
-    ? groups.find(group => group.id === activeGroupId)
-    : undefined
   const watchlistContentLoading = list.isLoading || (allSymbols.length > 0 && enriched.isLoading)
 
   // 实时监控圆点: 仅 Free/低档 "按自选股实时监控" 模式 (mode === 'watchlist') 下显示;
@@ -1255,6 +1237,13 @@ export function Watchlist() {
     [filteredRows, sortRows, columns],
   )
 
+  // 切股导航列表: 按列表当前展示顺序 (与 sortedRows 一致, 排序/筛选后行序随之变化)。
+  // 弹窗未打开时跳过构建 — sortedRows 随行情 tick 重建, 避免无谓分配。
+  const previewNavItems = useMemo(
+    () => previewSymbol ? toNavItems(sortedRows) : [],
+    [previewSymbol, sortedRows],
+  )
+
   const cardColumns = useCardColumnCount()
   const cardGridRef = useRef<HTMLDivElement>(null)
   const virtualizeCards = viewMode === 'card' && !groupCardsOpen && sortedRows.length > VIRTUAL_LIST_THRESHOLD
@@ -1341,6 +1330,7 @@ export function Watchlist() {
       onToggleExpand={handleToggleExpand}
       onDimensionClick={setDimensionTarget}
       isMonitored={monitoredSymbols.has(r.symbol)}
+      active={previewSymbol === r.symbol}
       groups={groups}
       onToggleMember={handleToggleMember}
       groupChangePending={addGroupMember.isPending || removeGroupMember.isPending}
@@ -1417,19 +1407,12 @@ export function Watchlist() {
               memberPending={addGroupMember.isPending || removeGroupMember.isPending}
             />
             <button
-              onClick={() => {
-                if (ocrAvailable === false) return
-                setImportOpen(true)
-              }}
-              disabled={ocrAvailable === false}
-              className="inline-flex items-center justify-center h-8 w-8 rounded-btn bg-elevated hover:bg-elevated/80 text-secondary hover:text-foreground transition-colors duration-150 ease-smooth disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-elevated disabled:hover:text-secondary"
-              title={
-                ocrAvailable === false
-                  ? ocrInstallHint || 'OCR 不可用，请先安装 Tesseract'
-                  : '从截图导入自选'
-              }
+              onClick={() => setImportOpen(true)}
+              className="inline-flex items-center justify-center h-8 w-8 rounded-btn bg-elevated hover:bg-elevated/80 text-secondary hover:text-foreground transition-colors duration-150 ease-smooth"
+              title="批量导入自选（截图 / CSV / 粘贴代码）"
+              aria-label="批量导入自选"
             >
-              <ImagePlus className="h-4 w-4" />
+              <FileUp className="h-4 w-4" />
             </button>
             <div className="w-px h-5 bg-border" />
             {/* 视图 */}
@@ -1640,13 +1623,13 @@ export function Watchlist() {
             <EmptyState
               icon={Star}
               title="自选股为空"
-              hint="点击右上角搜索添加标的，或点击图片图标从券商自选截图批量导入。"
+              hint="点击右上角搜索添加标的，或用导入按钮从券商自选 CSV / 截图批量导入、粘贴代码。"
             />
           ) : rowsInSelectedGroup.length === 0 ? (
             <EmptyState
               icon={FolderOpen}
               title="该分组暂无标的"
-              hint="使用右上角搜索添加，或通过股票旁的分组按钮移入当前分组。"
+              hint="使用右上角搜索添加、通过股票旁的分组按钮移入，或用导入弹窗把整批标的并入本组。"
             />
           ) : groupCardsOpen ? (
             <WatchlistGroupCards
@@ -1668,7 +1651,7 @@ export function Watchlist() {
               onSortToggle={handleSortToggle}
               extraSortableKeys={INTRADAY_SORTABLE_KEYS}
               rowKey={(r: any) => r.symbol}
-              rowClassName={() => 'border-t border-border hover:bg-elevated/50 transition-colors duration-150 ease-smooth'}
+              rowClassName={(r: any) => cn('border-t border-border transition-colors duration-150 ease-smooth hover:bg-elevated/50', r.symbol === previewSymbol && 'bg-accent/10 hover:bg-accent/15')}
               // 日k列表头：标签 + 显示/隐藏眼睛按钮
               renderHeaderContent={(col) => {
                 if (col.source.type === 'builtin' && col.source.key === 'candle') {
@@ -1990,15 +1973,19 @@ export function Watchlist() {
         symbol={previewSymbol}
         name={previewName}
         onClose={closePreview}
+        navList={previewNavList.length > 0 ? previewNavList : previewNavItems}
+        onNavigate={(sym, n) => { setPreviewSymbol(sym); setPreviewName(n ?? '') }}
       />
 
       <DimensionMembersDialog
         target={dimensionTarget}
         onClose={() => setDimensionTarget(null)}
-        onStockClick={(symbol, name) => {
+        onStockClick={(symbol, name, navList) => {
           setDimensionTarget(null)
           setPreviewSymbol(symbol)
           setPreviewName(name ?? '')
+          // 成分列表作为切股导航 (成员可能不在自选列表, 不能退回 previewNavItems)
+          setPreviewNavList(navList ?? previewNavItems)
         }}
       />
 
@@ -2006,8 +1993,8 @@ export function Watchlist() {
         open={importOpen}
         onClose={() => setImportOpen(false)}
         groupId={activeGroupId}
-        groupName={activeGroup?.name}
-        groupColor={activeGroup?.color}
+        groups={groups}
+        existingBySymbol={groupBySymbol}
       />
     </div>
   )
