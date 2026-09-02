@@ -95,10 +95,6 @@ backend/_desktop_run.log
 reports/tickflow_pro_probe/
 .cursor/debug-*.log
 
-# ===== 研究/输出克隆(不应入库) =====
-output/
-backend/output/
-
 # ===== 打包产物 (本地构建的安装包,不入库) =====
 backend/TickFlowStockPanel-win-x64.zip
 backend/TickFlowStockPanel-macos.zip
@@ -113,9 +109,3 @@ TickFlowStockPanel.app/
 TickFlowStockPanel-macos*.dmg
 TickFlowStockPanel-macos*.zip
 reports/cursor_tickflow_pro_rate_limit_p0.bundle
-
-# ===== 内置插件构建产物 (Go 二进制/校验锁文件/运行缓存, 应在 Docker 构建时重新生成) =====
-backend/app/plugins/tdxgo/bin/
-backend/app/plugins/tdxgo/data/
-backend/app/plugins/tdxgo/go.sum
-backend/app/plugins/tdxgo/*.log

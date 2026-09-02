@@ -415,11 +415,6 @@ def build_market_overview(
                 if (_finite(r.get("volume")) or 0) > 0
                 or (_finite(r.get("change_pct")) or 0) != 0]
 
-    # 排名用行: 进一步剔除停牌(volume=0)。实时快照对停牌股返回 close=0 → 涨跌幅 -100%,
-    # 会被上面的过滤保留(change_pct≠0), 从而以假 -100% 混进涨幅/跌幅/成交额/活跃换手榜。
-    # 停牌股无成交, 不应参与排名, 但保留在总览广度/板块计数里。
-    rank_rows = [r for r in rows if (_finite(r.get("volume")) or 0) > 0]
-
     total = len(rows)
     up = sum(1 for r in rows if (_finite(r.get("change_pct")) or 0) > 0)
     down = sum(1 for r in rows if (_finite(r.get("change_pct")) or 0) < 0)
@@ -591,10 +586,10 @@ def build_market_overview(
         },
         "radar": radar,
         "emotion": {"score": emotion_score, "label": emotion_label},
-        "top_gainers": _top_rows(rank_rows, "change_pct", True),
-        "top_losers": _top_rows(rank_rows, "change_pct", False),
-        "turnover_leaders": _top_rows(rank_rows, "amount", True),
-        "active_leaders": _top_rows(rank_rows, "turnover_rate", True),
+        "top_gainers": _top_rows(rows, "change_pct", True),
+        "top_losers": _top_rows(rows, "change_pct", False),
+        "turnover_leaders": _top_rows(rows, "amount", True),
+        "active_leaders": _top_rows(rows, "turnover_rate", True),
         "concept_rank": concept_rank,
         "industry_rank": industry_rank,
     })
