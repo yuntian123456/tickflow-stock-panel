@@ -5,12 +5,25 @@
 方法签名对齐 custom.GenericHTTPProvider(service 分流点按这套签名调用),
 因此注入 custom loader 注册表后, 各 service 无需改动即可路由到本 provider。
 
-数据集: daily / adj_factor / minute / realtime / full_minute + instruments(标的维表)。
-financial 未声明: financial_sync 直连 TickFlow SDK, 不走 provider 抽象。
+数据集: daily / adj_factor / minute / realtime / full_minute / depth5 + instruments(标的维表)。
+financial 未声明: F10 T 码行业分类不可靠, financial_sync 走 TickFlow, 不经 provider 抽象。
+
+iter_daily: 全市场日K同步(kline_sync)优先消费的有界分批流 —— 按 _BATCH 切片逐批
+让出, 避免全市场日K在 provider 内攒完整 DataFrame(契约: 批次有上界, 不许先收集
+再 concat; on_chunk_done 必须覆盖空批, 流结束时 cur == total)。
+
+depth5: 五档盘口走 quotes.get_depth(0x0547 增量刷新, 首次游标 0 即完整五档;
+单请求上限 100 代码, provider 内按 _SNAPSHOT_BATCH=80 子分片)。档位 volume 与
+total_hand 同口径(手); update_time_raw 为服务端行情墙钟 HHMMSS, 组合当日北京
+日期转毫秒时间戳(契约: 优先服务端行情归属时间)。
+
+契约允许且有意不实现: get_intraday_latest(TDX 无单请求全市场分钟端点 → 服务降级
+仅修复轮 60s, 见 get_intraday_batch); get_realtime_indices(快照已含受管指数,
+实现会被 quote_service 重复追加拉取)。
 
 口径注意(与项目内部契约核对):
 - realtime 的 change_pct 上游为百分数(如 3.66), 本 provider 转小数制(0.0366)。
-- volume 单位为「手」(eltdx volume_lots / total_hand), 与项目内部契约一致
+- volume 单位为「手」(eltdx volume_lots / total_hand / 盘口档位), 与项目内部契约一致
   (fuyao 也是把上游股→手, quote_service 按手计成交量)。
 - get_adj_factors: eltdx >=3.1.0 移除 helpers.factors/xdxr, 改用服务端
   前复权(qfq)与不复权K线比值推导事件因子 ex(D) = cum(D)/cum(D-1)。
@@ -36,7 +49,8 @@ logger = logging.getLogger(__name__)
 
 # eltdx 支持的数据集(financial 不支持 → 不声明, 自动回退 tickflow)。
 # full_minute: 全量分钟修复轮(当日全市场批量分钟), 见 get_intraday_batch。
-_DATASETS = ("daily", "adj_factor", "minute", "realtime", "full_minute")
+# depth5: 五档盘口, 见 get_depth_batch。
+_DATASETS = ("daily", "adj_factor", "minute", "realtime", "full_minute", "depth5")
 
 _EXCHANGE_TO_TDX = {"SH": "sh", "SZ": "sz", "BJ": "bj"}
 _TDX_TO_EXCHANGE = {v: k for k, v in _EXCHANGE_TO_TDX.items()}
@@ -183,6 +197,24 @@ def _naive(t) -> datetime:
     return t.replace(tzinfo=None) if t.tzinfo is not None else t
 
 
+def _depth_timestamp_ms(raw) -> int:
+    """QuoteRefreshRecord.update_time_raw(服务端行情墙钟 HHMMSS, 如 153301)
+    → 毫秒 Unix 时间戳: 组合当日北京日期(行情归属日), 缺失/异常退本地当前时间。
+    (契约: timestamp 优先用服务端时间; 服务端只给日内时分秒, 日期取北京今天。)"""
+    now = cn_now()
+    if raw:
+        try:
+            v = int(raw)
+            h, rem = divmod(v, 10000)
+            m, s = divmod(rem, 100)
+            return int(
+                now.replace(hour=h, minute=m, second=s, microsecond=0).timestamp() * 1000
+            )
+        except (TypeError, ValueError):
+            pass
+    return int(now.timestamp() * 1000)
+
+
 def _bar_to_daily_row(bar, symbol: str) -> dict:
     """eltdx KlineBar → 内部日K行(不含 datetime, 避免与 date 冲突)。"""
     return {
@@ -292,20 +324,13 @@ class EltdxProvider:
         return results
 
     # ---- daily ----
-    def get_daily(
-        self,
-        symbols: list[str],
-        start_time: datetime | None,
-        end_time: datetime | None,
-        asset_type: str = "stock",
-        on_chunk_done=None,
-    ) -> pl.DataFrame:
-        if not symbols:
-            return pl.DataFrame()
+    def _daily_fetcher(self, start_time: datetime | None, end_time: datetime | None):
+        """构造单标的日K拉取闭包(get_daily 与 iter_daily 共用)。
 
-        # 窗口内最多 (end-start).days 根日线: 窗口较小时用单次 bars.get(count)
-        # 替代 bars.all 全量翻页(每代码 3~4 次请求 → 1 次), 日K同步提速明显;
-        # 窗口超过单请求上限(约 2.7 年)或未传窗口时回退全量翻页保证完整性。
+        窗口内最多 (end-start).days 根日线: 窗口较小时用单次 bars.get(count)
+        替代 all_pages 全量翻页(每代码 3~4 次请求 → 1 次), 日K同步提速明显;
+        窗口超过单请求上限(约 2.7 年)或未传窗口时回退全量翻页保证完整性。
+        """
         window_days = None
         if start_time and end_time:
             window_days = max(0, (end_time - start_time).days)
@@ -333,8 +358,46 @@ class EltdxProvider:
                 df = df.filter(pl.col("date") <= end_time.date())
             return df if not df.is_empty() else None
 
-        frames = self._run_concurrent(symbols, fetch_one, on_chunk_done)
+        return fetch_one
+
+    def get_daily(
+        self,
+        symbols: list[str],
+        start_time: datetime | None,
+        end_time: datetime | None,
+        asset_type: str = "stock",
+        on_chunk_done=None,
+    ) -> pl.DataFrame:
+        if not symbols:
+            return pl.DataFrame()
+
+        frames = self._run_concurrent(symbols, self._daily_fetcher(start_time, end_time), on_chunk_done)
         return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+
+    def iter_daily(
+        self,
+        symbols: list[str],
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        asset_type: str = "stock",
+        on_chunk_done=None,
+    ):
+        """(契约 iter_daily) 有界分批日K流: 生成器逐批让出与 get_daily 同形的帧。
+
+        kline_sync 全市场历史同步优先消费本方法(每批写 staging 后流式提交,
+        内存峰值 = 单批)。按 _BATCH 切片, 批内 _run_concurrent 并发; 进度改为
+        本方法按批上报(on_chunk_done(cur, total), 覆盖空批, 流结束 cur == total),
+        不再交给批内 _run_concurrent, 避免双重计数。
+        """
+        if not symbols:
+            return
+        fetch_one = self._daily_fetcher(start_time, end_time)
+        total = (len(symbols) + _BATCH - 1) // _BATCH
+        for cur, chunk in enumerate(chunked(list(symbols), _BATCH), start=1):
+            frames = self._run_concurrent(list(chunk), fetch_one)
+            yield pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+            if on_chunk_done:
+                on_chunk_done(cur, total)
 
     # ---- adj_factor ----
     def get_adj_factors(
@@ -560,6 +623,44 @@ class EltdxProvider:
             logger.warning("eltdx realtime 拉取失败: %s", e)
             return []
 
+    # ---- depth5 (五档盘口) ----
+    def get_depth_batch(self, symbols: list[str]) -> dict[str, dict]:
+        """五档盘口(声明 depth5 数据集): quotes.get_depth, 0x0547 首次刷新(游标 0)
+        即返回完整五档。返回 {symbol: {bid_prices, bid_volumes, ask_prices,
+        ask_volumes, timestamp}}; 价格/数量数组按一档到五档排列, 数量单位为手。
+
+        服务层(depth_service)按 capability batch/rpm 统一分片限速, provider 不跨源
+        回退; 但 eltdx 0x0547 单请求硬上限 100 代码(超限服务端静默截断, 客户端拒发),
+        故按 _SNAPSHOT_BATCH=80 子分片并发拉取(每 worker 复用连接)。
+        """
+        if not symbols:
+            return {}
+        groups = list(chunked(list(symbols), _SNAPSHOT_BATCH))
+
+        def fetch_one(cc, group) -> dict[str, dict]:
+            out: dict[str, dict] = {}
+            page = cc.quotes.get_depth(list(group))
+            for rec in (page.records or []):
+                # QuoteRefreshRecord 无 full_code 字段(eltdx 3.x dataclass), 按
+                # exchange+code 重建; 个别版本带 full_code 时优先使用。
+                full = getattr(rec, "full_code", None) or f"{rec.exchange}{rec.code}"
+                levels = rec.buy_levels or []
+                sell_levels = rec.sell_levels or []
+                out[_to_symbol(full)] = {
+                    "bid_prices": [float(lv.price) for lv in levels],
+                    "bid_volumes": [int(lv.volume) for lv in levels],
+                    "ask_prices": [float(lv.price) for lv in sell_levels],
+                    "ask_volumes": [int(lv.volume) for lv in sell_levels],
+                    "timestamp": _depth_timestamp_ms(rec.update_time_raw),
+                }
+            return out
+
+        merged: dict[str, dict] = {}
+        # 五档轮询与实时快照同为周期性秒级任务, 复用 4 worker 配置。
+        for batch_out in self._run_concurrent(groups, fetch_one, workers=_REALTIME_WORKERS):
+            merged.update(batch_out)
+        return merged
+
     # ---- 测试(设置页试拉) ----
     def test_dataset(self, dataset: str, symbols: list[str] | None = None) -> dict:
         symbols = symbols or ["600519.SH"]
@@ -583,6 +684,16 @@ class EltdxProvider:
                 "dataset": "realtime",
                 "rows": len(rows),
                 "columns": list(head[0].keys()) if head else [],
+                "preview": head,
+            }
+        if dataset == "depth5":
+            data = self.get_depth_batch(symbols)
+            head = [{"symbol": sym, **data[sym]} for sym in list(data)[:5]]
+            return {
+                "provider": self.name,
+                "dataset": "depth5",
+                "rows": len(data),
+                "columns": ["bid_prices", "bid_volumes", "ask_prices", "ask_volumes", "timestamp"],
                 "preview": head,
             }
         raise ValueError(f"eltdx 不支持数据集: {dataset}")

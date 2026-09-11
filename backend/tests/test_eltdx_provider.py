@@ -94,6 +94,7 @@ class FakeTdxClient:
         xdxr=None,
         bars_get_fn=None,
         series_by_adjust=None,
+        depths=None,
     ):
         self._series = series
         self._factors = factors
@@ -105,9 +106,14 @@ class FakeTdxClient:
         self._xdxr = xdxr or []
         self._bars_get_fn = bars_get_fn
         self._series_by_adjust = series_by_adjust
+        self._depths = depths or []
+        self.depth_calls: list[list[str]] = []
         # eltdx >=3.1.0: bars.all 并入 bars.get(..., all_pages=True)
         self.bars = SimpleNamespace(get=self._bars_get)
-        self.quotes = SimpleNamespace(get_snapshots=self._quotes_get_snapshots)
+        self.quotes = SimpleNamespace(
+            get_snapshots=self._quotes_get_snapshots,
+            get_depth=self._quotes_get_depth,
+        )
         self.codes = SimpleNamespace(
             all_a_shares=self.codes_all_a_shares,
             all_etfs=self.codes_all_etfs,
@@ -167,6 +173,10 @@ class FakeTdxClient:
     def _quotes_get_snapshots(self, codes):
         return self._snapshots
 
+    def _quotes_get_depth(self, codes):
+        self.depth_calls.append(list(codes))
+        return SimpleNamespace(records=self._depths)
+
 
 @pytest.fixture
 def fake_eltdx(monkeypatch):
@@ -189,7 +199,7 @@ def test_plugin_discovered_in_loader():
     manifest = plugins.get("eltdx")
     assert manifest is not None
     assert manifest["runtime"] == "python"
-    assert manifest["datasets"] == ["daily", "adj_factor", "minute", "realtime", "full_minute"]
+    assert manifest["datasets"] == ["daily", "adj_factor", "minute", "realtime", "full_minute", "depth5"]
     assert "financial" not in manifest["datasets"]
 
 
@@ -204,7 +214,7 @@ def test_plugin_registered_when_available(monkeypatch):
     provider = cs_loader.get_provider("eltdx")
     assert provider is not None
     assert provider.builtin is True
-    assert {"daily", "adj_factor", "minute", "realtime"} <= set(provider.config.datasets)
+    assert {"daily", "adj_factor", "minute", "realtime", "depth5"} <= set(provider.config.datasets)
 
 
 # ---- 可用性检测 ----
@@ -459,6 +469,133 @@ def test_get_minute_index_kind(fake_eltdx):
     df = provider.get_minute(["000001.SH"], None, None, freq="1m")
     assert df.columns == ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
     assert kind_log == ["index"]
+
+
+# ---- iter_daily(契约: 有界分批流, on_chunk_done 覆盖空批, 结束 cur==total) ----
+
+
+def test_iter_daily_single_batch_with_empty_chunk(fake_eltdx):
+    """单批: 无数据标的产生空帧, 进度仍上报且 cur == total。"""
+
+    def fn(code, **kwargs):
+        if code == "sz000003":
+            return SimpleNamespace(bars=[])  # 空页 → 该标的无数据
+        return SimpleNamespace(bars=[_bar(datetime(2026, 1, 2, 15, 0), close=10.0)])
+
+    fake_eltdx(FakeTdxClient(bars_get_fn=fn))
+    provider = EltdxProvider()
+    progress: list[tuple[int, int]] = []
+    frames = list(
+        provider.iter_daily(
+            ["000001.SZ", "000002.SZ", "000003.SZ"],
+            datetime(2026, 1, 1),
+            datetime(2026, 1, 2, 23, 59),
+            on_chunk_done=lambda cur, tot: progress.append((cur, tot)),
+        )
+    )
+    assert progress == [(1, 1)]  # _BATCH=80 → 3 只一批; 空批也计数
+    non_empty = [f for f in frames if not f.is_empty()]
+    df = pl.concat(non_empty, how="diagonal_relaxed")
+    assert df["symbol"].to_list() == ["000001.SZ", "000002.SZ"]
+
+
+def test_iter_daily_multi_batch_progress(fake_eltdx):
+    """超过 _BATCH 的标的集切成多批, 每批一次进度回调, 终点 cur == total。"""
+    fake_eltdx(FakeTdxClient(series=SimpleNamespace(bars=[_bar(datetime(2026, 1, 2, 15, 0), close=10.0)])))
+    provider = EltdxProvider()
+    progress: list[tuple[int, int]] = []
+    symbols = [f"{i:06d}.SZ" for i in range(1, 82)]  # 81 只 → 80 + 1 两批
+    frames = list(
+        provider.iter_daily(
+            symbols,
+            datetime(2026, 1, 1),
+            datetime(2026, 1, 2, 23, 59),
+            on_chunk_done=lambda cur, tot: progress.append((cur, tot)),
+        )
+    )
+    assert progress == [(1, 2), (2, 2)]
+    assert len(frames) == 2
+    total_rows = sum(f.height for f in frames)
+    assert total_rows == 81
+
+
+# ---- depth5(五档盘口) ----
+
+
+def _level(price, volume):
+    return SimpleNamespace(price=price, volume=volume)
+
+
+def _depth_rec(exchange="sz", code="000001", update_time_raw=153301, bid=None, ask=None):
+    return SimpleNamespace(
+        exchange=exchange,
+        code=code,
+        update_time_raw=update_time_raw,
+        buy_levels=bid if bid is not None else [_level(11.74, 1329), _level(11.73, 3048)],
+        sell_levels=ask if ask is not None else [_level(11.75, 761), _level(11.76, 245)],
+    )
+
+
+def test_get_depth_batch_mapping(fake_eltdx):
+    """五档映射: symbol 归一、档位数组一手到N档、HHMMSS → 北京墙钟毫秒。"""
+    fake_eltdx(FakeTdxClient(depths=[_depth_rec()]))
+    provider = EltdxProvider()
+    data = provider.get_depth_batch(["000001.SZ"])
+    assert set(data) == {"000001.SZ"}
+    d = data["000001.SZ"]
+    assert d["bid_prices"] == [11.74, 11.73]
+    assert d["bid_volumes"] == [1329, 3048]
+    assert d["ask_prices"] == [11.75, 11.76]
+    assert d["ask_volumes"] == [761, 245]
+    # update_time_raw=153301 → 当日北京 15:33:01 的毫秒时间戳
+    from app.market_time import cn_now
+
+    expect = int(cn_now().replace(hour=15, minute=33, second=1, microsecond=0).timestamp() * 1000)
+    assert d["timestamp"] == expect
+
+
+def test_get_depth_batch_timestamp_fallback(fake_eltdx):
+    """update_time_raw 缺失时退本地当前时间(毫秒), 不伪造服务端时间。"""
+    import time as _t
+
+    fake_eltdx(FakeTdxClient(depths=[_depth_rec(update_time_raw=None)]))
+    provider = EltdxProvider()
+    before = int(_t.time() * 1000)
+    data = provider.get_depth_batch(["000001.SZ"])
+    after = int(_t.time() * 1000)
+    assert before <= data["000001.SZ"]["timestamp"] <= after
+
+
+def test_get_depth_batch_subchunk_protocol_limit(fake_eltdx):
+    """0x0547 单请求上限 100 代码 → 170 只按 80/80/10 子分片(3 次请求)。"""
+    fake_eltdx(FakeTdxClient(depths=[_depth_rec()]))
+    provider = EltdxProvider()
+    symbols = [f"{i:06d}.SZ" for i in range(1, 171)]
+    provider.get_depth_batch(symbols)
+    assert [len(c) for c in fake_depth_calls(provider)] == [80, 80, 10]
+
+
+def fake_depth_calls(provider) -> list[list[str]]:
+    """从注入的 fake client 取回 get_depth 调用批次。
+
+    fake_eltdx 注入的 TdxClient 固定返回同一 FakeTdxClient 实例,
+    直接再取一次即可拿到带调用记录的实例。
+    """
+    import sys
+
+    return sys.modules["eltdx"].TdxClient().depth_calls
+
+
+def test_test_dataset_depth5(fake_eltdx):
+    fake_eltdx(FakeTdxClient(depths=[_depth_rec(update_time_raw=93000, bid=[_level(10.0, 10)], ask=[_level(10.1, 20)])]))
+    provider = EltdxProvider()
+    out = provider.test_dataset("depth5", ["000001.SZ"])
+    assert out["provider"] == "eltdx"
+    assert out["dataset"] == "depth5"
+    assert out["rows"] == 1
+    assert out["columns"][0] == "bid_prices"
+    assert out["preview"][0]["symbol"] == "000001.SZ"
+    assert out["preview"][0]["bid_volumes"] == [10]
 
 
 def test_get_daily_etf_kind_is_stock(fake_eltdx):
