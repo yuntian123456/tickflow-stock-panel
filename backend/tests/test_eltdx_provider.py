@@ -111,6 +111,7 @@ class FakeTdxClient:
         self.depth_calls: list[list[str]] = []
         self._connect_fail_times = connect_fail_times
         self.connect_calls = 0
+        self.codes_calls = 0
         # eltdx >=3.1.0: bars.all 并入 bars.get(..., all_pages=True)
         self.bars = SimpleNamespace(get=self._bars_get)
         self.quotes = SimpleNamespace(
@@ -160,6 +161,7 @@ class FakeTdxClient:
 
     # ---- codes 模块(all_xxx 返回 full_code 字符串, 按前缀分类为互斥三类) ----
     def codes_all_a_shares(self):
+        self.codes_calls += 1
         return [
             it
             for it in (self._codes or [])
@@ -419,6 +421,28 @@ def test_get_realtime(fake_eltdx):
     assert rows[1]["symbol"] == "600000.SH"
     assert rows[1]["change_pct"] == -0.005
     assert rows[1]["change_amount"] == 0.0  # 平盘: last == prev
+
+
+def test_get_realtime_codes_cached_across_rounds(fake_eltdx):
+    """代码表实例级 TTL 缓存: 第二轮轮询不再重拉代码表(实测拉三表 ~5.5s,
+    6s 轮询周期不缓存则全耗在代码表上)。"""
+    codes = ["sz000001", "sh600000"]
+    snapshots = [
+        SimpleNamespace(
+            full_code="sz000001", last_price=12.0, pre_close_price=10.0,
+            open_price=10.5, high_price=12.1, low_price=10.4,
+            total_hand=100, amount=1.2e6, change_pct=20.0,
+        ),
+    ]
+    fake = FakeTdxClient(codes=codes, snapshots=snapshots)
+    fake_eltdx(fake)
+    provider = EltdxProvider()
+    assert len(provider.get_realtime()) == 1
+    first_calls = fake.codes_calls
+    assert first_calls >= 1
+    # 第二轮: 快照仍实时拉取, 代码表命中实例缓存
+    assert len(provider.get_realtime()) == 1
+    assert fake.codes_calls == first_calls
 
 
 # ---- instruments ----

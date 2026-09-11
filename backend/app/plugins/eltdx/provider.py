@@ -21,6 +21,18 @@ total_hand 同口径(手); update_time_raw 为服务端行情墙钟 HHMMSS, 组�
 仅修复轮 60s, 见 get_intraday_batch); get_realtime_indices(快照已含受管指数,
 实现会被 quote_service 重复追加拉取)。
 
+接口选型实测审计(2026-09, eltdx 3.1.0):
+- adj_factor 保持「服务端 qfq/raw 比值推导」而非 corporate.adjustment_factors
+  (0x000f 事件返回仿射参数 qfq_scale/qfq_offset, 与项目乘法因子契约不匹配;
+  capital_changes/GBBX 事件含每10股分红但缺昨收价, 仍需配日K才能算 ex_factor,
+  不比现方案(2 请求/标的、含分红权威)更优)。
+- get_realtime 代码表走实例级 TTL 缓存(实测新 client 拉三表 ~5.5s, 不缓存则
+  6s 轮询周期几乎全耗在代码表上)。
+- financial 不声明: corporate.finance_batch 只有股本快照(已用于 instruments.ext
+  供换手率), helpers.daily_shares 仅当前股本单条(非历史序列), f10.finance_report
+  为 T 码字段(T0xx 无权威语义映射, 误映射=看似合理的错误结果), 三大报表无法
+  可靠映射 → 财务走 fuyao(配 Key)或 TickFlow(Expert 档)。
+
 口径注意(与项目内部契约核对):
 - realtime 的 change_pct 上游为百分数(如 3.66), 本 provider 转小数制(0.0366)。
 - volume 单位为「手」(eltdx volume_lots / total_hand / 盘口档位), 与项目内部契约一致
@@ -263,6 +275,12 @@ class EltdxProvider:
         self._managed_cache: dict[str, set[str]] = {}
         self._managed_cache_at: float = 0.0
         self._managed_cache_ttl = 300.0
+        # 全市场代码表缓存(实例级): 实测新建 client 拉三表(A股+ETF+指数) ~5.5s,
+        # 而 get_realtime 6s 一轮 —— 不缓存等于每轮重拉代码表, 快照反而不是大头。
+        # TTL 与受管集合一致(300s), 新股/退市/维表变更在 TTL 刷新后自动生效。
+        self._codes_cache: list[str] | None = None
+        self._codes_cache_at: float = 0.0
+        self._codes_cache_ttl = 300.0
 
     def close(self) -> None:  # loader.load_all 会对每个 provider 调 close
         pass
@@ -633,29 +651,37 @@ class EltdxProvider:
         self._managed_cache_at = now
         return out
 
+    def _market_codes(self) -> list[str]:
+        """全市场代码表(实例级 TTL 缓存): A股全量 + 受管 ETF/指数。
+
+        实测新建 client 拉三表 ~5.5s —— get_realtime 秒级轮询若每轮重建 client
+        重拉代码表, 轮询周期几乎全耗在代码表上。TTL 300s 内直接复用; 受管集合
+        过滤(只保留主项目已同步的指数/ETF, 其余 880/881xxx 板块指数等会污染
+        kline_daily)在缓存构建时执行一次, 维表变更随 TTL 刷新生效。
+        """
+        now = time.monotonic()
+        if self._codes_cache is not None and now - self._codes_cache_at < self._codes_cache_ttl:
+            return self._codes_cache
+        with self._client() as c:
+            idx_set = self._read_managed_symbols("instruments_index")
+            etf_set = self._read_managed_symbols("instruments_etf")
+            codes = list(c.codes.all_a_shares())
+            codes += [
+                x for x in c.codes.all_etfs()
+                if not etf_set or _to_symbol(x) in etf_set
+            ]
+            codes += [
+                x for x in c.codes.all_indices()
+                if not _is_block_code(x) and (not idx_set or _to_symbol(x) in idx_set)
+            ]
+        self._codes_cache = codes
+        self._codes_cache_at = now
+        return codes
+
     def get_realtime(self) -> list[dict]:
-        """全市场实时快照: 先取代码表, 再按 TDX 批量上限分批取快照拼成全市场。"""
+        """全市场实时快照: 取代码表(实例级缓存), 再按 TDX 批量上限分批取快照拼成全市场。"""
         try:
-            with self._client() as c:
-                # 全市场实时快照需包含 ETF 与指数。旧实现只拉 A股代码,
-                # 导致 quote_service 切分后的 etf/index 无实时记录(数据不更新)。
-                # 三个 codes 方法底层共享 codes.all_markets() 缓存, 不会重复拉代码表。
-                # 只返回主项目已同步的指数/ETF(受管集合): 其余指数(通达信板块指数 880/881xxx、
-                # 999xxx、399379/399380 等统计指数)会被 quote_service 当作 stock 写入
-                # kline_daily, 污染涨幅/成交额榜。受管集合每次轮询重建时重新读取, 维表变更
-                # 会在代码表缓存(TTL)刷新后自动生效; 集合为空(未同步)则不过滤, 回退旧行为。
-                idx_set = self._read_managed_symbols("instruments_index")
-                etf_set = self._read_managed_symbols("instruments_etf")
-                codes = []
-                codes += c.codes.all_a_shares()
-                codes += [
-                    x for x in c.codes.all_etfs()
-                    if not etf_set or _to_symbol(x) in etf_set
-                ]
-                codes += [
-                    x for x in c.codes.all_indices()
-                    if not _is_block_code(x) and (not idx_set or _to_symbol(x) in idx_set)
-                ]
+            codes = self._market_codes()
 
             # 先按 _SNAPSHOT_BATCH 分组, 再把组交给 _run_concurrent 并发分片:
             # _run_concurrent 是「每 worker 每 symbol 调一次 fetch_one」, 若把原始
