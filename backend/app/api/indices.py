@@ -9,7 +9,6 @@ import polars as pl
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.indicators.pipeline import compute_enriched
-from app.market_time import cn_today
 from app.services import index_sync, kline_sync
 from app.tickflow.capabilities import Cap
 
@@ -71,9 +70,12 @@ def get_index_minute(
 ):
     """实时读取指数分钟 K。不写入股票分钟 parquet。"""
     repo = request.app.state.repo
+    capset = request.app.state.capabilities
     info = _index_info(repo, symbol)
-    day = trade_date or cn_today()
-    df = kline_sync.fetch_minute_single(symbol, day, asset_type="index")
+    day = trade_date or date.today()
+    df = kline_sync.fetch_minute_single(
+        symbol, day, asset_type="index", capset=capset,
+    )
     return {
         "symbol": symbol,
         "name": info.get("name"),

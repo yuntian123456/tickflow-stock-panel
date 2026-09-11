@@ -15,12 +15,14 @@ import {
   Rocket,
   Save,
   Settings2,
+  Sparkles,
   Square,
 } from 'lucide-react'
 import { EmptyState } from '@/components/EmptyState'
 import { toast } from '@/components/Toast'
 import {
   api,
+  type AutoScreening,
   type FactorColumn,
   type MiningBudgetProfile,
   type MiningCandidateGate,
@@ -55,6 +57,23 @@ const PROFILE_LABELS: Record<MiningBudgetProfile, string> = {
   exploratory: '探索档',
   balanced: '均衡档',
   strict: '严格档',
+}
+// 市场环境覆盖不足的失败文案 (regime_alignment 校验抛出), 命中时弹「补算并重跑」确认。
+const REGIME_COVERAGE_ERROR_RE = /市场环境数据覆盖不完整|市场环境数据为空/
+const REGIME_FIRST_MISSING_RE = /缺少前一交易日环境\s*(\d{4}-\d{2}-\d{2})/
+
+/** run.request 带 auto/auto_screening 附加字段, 而 start 接口 extra="forbid", 重跑前剥回纯 MiningRequestV1。 */
+function stripMiningRequestExtras(request: MiningRun['request']): MiningRequestV1 {
+  const {
+    factor_names, strategy_ids, symbols, asset_type, start, end, budget_profile,
+    commission_pct, stamp_tax_pct, slippage_bps, correlation_threshold,
+    max_combination_factors, beam_width, max_finalists, force,
+  } = request
+  return {
+    factor_names, strategy_ids, symbols, asset_type, start, end, budget_profile,
+    commission_pct, stamp_tax_pct, slippage_bps, correlation_threshold,
+    max_combination_factors, beam_width, max_finalists, force,
+  }
 }
 
 interface MiningDraft {
@@ -192,6 +211,62 @@ function foldKindLabel(kind?: string | null) {
   if (kind === 'cross') return '跨折'
   if (kind === 'benchmark') return '对照'
   return undefined
+}
+
+function pctText(value: number | null | undefined, digits = 1) {
+  return typeof value === 'number' && Number.isFinite(value) ? `${(value * 100).toFixed(digits)}%` : '—'
+}
+
+/** 自动挖掘 L1 筛选摘要: 达标因子清单 + 失败原因分布 (来自任务请求的 auto_screening)。 */
+function AutoScreeningCard({ screening }: { screening: AutoScreening }) {
+  const gate = screening.gate
+  const reasons = Object.entries(screening.reason_counts).slice(0, 5)
+  const maxCount = Math.max(1, ...reasons.map(([, count]) => count))
+  return (
+    <section className="border-b border-border bg-accent/[0.03]">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2">
+        <span className="inline-flex items-center gap-1 text-xs font-semibold text-foreground">
+          <Sparkles className="h-3.5 w-3.5 text-accent" />
+          自动筛选 · 达标因子池
+        </span>
+        <span className="font-mono text-[10px] text-secondary">
+          {screening.n_qualified}/{screening.n_total} 个达标
+          {screening.pool_truncated ? `（取前 ${screening.pool.length} 个入池）` : ''}
+        </span>
+        <span className="text-[10px] text-muted">
+          门槛 |IC|≥{gate.min_abs_ic.toFixed(2)} · |IR|≥{gate.min_abs_ir.toFixed(2)} · |t|≥{gate.min_abs_t.toFixed(1)} · q≤{gate.max_q.toFixed(2)}
+          ，窗口 {screening.screen_window.start} ~ {screening.screen_window.end}
+        </span>
+      </div>
+      {screening.qualified.length > 0 && (
+        <div className="flex flex-wrap gap-1 px-3 pb-2">
+          {screening.qualified.map(item => (
+            <span
+              key={item.factor_name}
+              title={`${item.factor_name} · IC ${pctText(item.ic)} · IR ${item.ir?.toFixed(2) ?? '—'} · t ${item.t?.toFixed(2) ?? '—'} · q ${item.q?.toFixed(3) ?? '—'}`}
+              className={`inline-flex items-center gap-1 rounded-btn border px-1.5 py-0.5 text-[10px] font-medium ${item.direction > 0 ? 'border-bull/30 bg-bull/10 text-bull' : 'border-bear/30 bg-bear/10 text-bear'}`}
+            >
+              {item.label}
+              {item.direction > 0 ? '↑' : '↓'}
+              <span className="font-mono opacity-80">{pctText(item.ic)}</span>
+            </span>
+          ))}
+        </div>
+      )}
+      {reasons.length > 0 && (
+        <div className="space-y-1 border-t border-border/60 px-3 py-2">
+          <div className="text-[10px] text-muted">未达标原因分布（{screening.n_total - screening.n_qualified} 个）：</div>
+          {reasons.map(([reason, count]) => (
+            <div key={reason} className="flex items-center gap-2 text-[10px]">
+              <span className="w-24 shrink-0 truncate text-secondary" title={reason}>{reason}</span>
+              <span className="h-1.5 rounded-full bg-accent/40" style={{ width: `${Math.max(6, (count / maxCount) * 140)}px` }} />
+              <span className="font-mono text-muted">{count}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  )
 }
 
 function SummaryStrip({ result }: { result: MiningResult }) {
@@ -548,6 +623,43 @@ export function MiningWorkbench() {
     onError: error => toast(`保存失败 · ${String((error as Error).message || error)}`, 'error'),
   })
 
+  // 市场环境覆盖不足: 挖矿内部 T-1 环境校验 (fail-closed) 失败时弹「补算并重跑」确认。
+  // 确定 → 调 regime/recompute 补算缺失区间后自动重跑同一 payload; 取消 → 仅关闭不动作。
+  const [regimeBackfill, setRegimeBackfill] = useState<{ payload: MiningRequestV1; start?: string } | null>(null)
+  const regimeErrorHandled = useRef('')
+  useEffect(() => {
+    if (task.isPending) {
+      regimeErrorHandled.current = ''
+      return
+    }
+    if (!task.error || !REGIME_COVERAGE_ERROR_RE.test(task.error)) return
+    if (regimeErrorHandled.current === task.error) return
+    const request = task.run?.request
+    if (!request) return
+    regimeErrorHandled.current = task.error
+    setRegimeBackfill({
+      payload: stripMiningRequestExtras(request),
+      start: REGIME_FIRST_MISSING_RE.exec(task.error)?.[1],
+    })
+  }, [task.error, task.isPending, task.run])
+  const regimeRecomputeAndRun = useMutation({
+    mutationFn: async (job: { payload: MiningRequestV1; start?: string }) => {
+      // start 缺省(环境数据为空)时后端从 enriched 最早日全量重算; 有 start 则只补缺口区间
+      const recomputed = await api.regimeRecompute(job.start)
+      return { recomputed, job }
+    },
+    onSuccess: ({ recomputed, job }) => {
+      for (const key of [QK.regimeLatest, QK.regimeCoverage, QK.regimeHistory()]) {
+        queryClient.invalidateQueries({ queryKey: key })
+      }
+      toast(recomputed.computed > 0 ? `环境补算完成 · 新增 ${recomputed.computed} 天，重新开始挖掘` : '环境数据已是最新，重新开始挖掘', 'success')
+      setRegimeBackfill(null)
+      submitMining(job.payload)
+    },
+    onError: error => toast(`环境补算失败 · ${String((error as Error).message || error)}`, 'error'),
+  })
+  const regimeBackdrop = useDialogBackdrop(() => setRegimeBackfill(null), () => !regimeRecomputeAndRun.isPending)
+
   const attachRun = (run: MiningRun) => {
     const params = new URLSearchParams(searchParams)
     params.set('run', run.run_id)
@@ -648,13 +760,13 @@ export function MiningWorkbench() {
 
           <div className="sticky bottom-0 flex gap-2 bg-base/95 py-2">
             <button type="button" disabled={task.isPending || !draft.factorNames.length || (draft.strategyIds.length > 0 && strategyQuery.isLoading) || !validDateRange || availabilityQuery.isPending || availabilityQuery.isFetching || availabilityQuery.isError || !availabilityQuery.data?.eligible} onClick={runMining} className="inline-flex h-8 flex-1 items-center justify-center gap-1.5 rounded-btn bg-accent px-3 text-xs font-semibold text-white transition-opacity disabled:cursor-not-allowed disabled:opacity-50"><Play className="h-3.5 w-3.5" />开始挖掘</button>
-            {task.isPending && <button type="button" title="取消任务" disabled={task.cancelling} onClick={() => void cancelMining()} className="inline-flex h-8 w-9 items-center justify-center rounded-btn border border-danger/40 text-danger hover:bg-danger/10 disabled:opacity-50"><Square className="h-3.5 w-3.5" /></button>}
+            {task.isPending && <button type="button" title={task.runId ? '取消任务' : '因子筛选阶段不可取消，run 创建后可取消'} disabled={task.cancelling || !task.runId} onClick={() => void cancelMining()} className="inline-flex h-8 w-9 items-center justify-center rounded-btn border border-danger/40 text-danger hover:bg-danger/10 disabled:cursor-not-allowed disabled:opacity-50"><Square className="h-3.5 w-3.5" /></button>}
           </div>
 
           <section className="border-t border-border pt-3">
             <div className="mb-2 flex items-center justify-between"><span className="text-[10px] font-semibold text-secondary">最近运行</span><button type="button" title="刷新历史" onClick={() => void runsQuery.refetch()} className="text-muted hover:text-accent"><RefreshCw className={`h-3 w-3 ${runsQuery.isFetching ? 'animate-spin' : ''}`} /></button></div>
             <div className="max-h-40 space-y-1 overflow-y-auto">
-              {(runsQuery.data?.items ?? []).map(run => <button key={run.run_id} type="button" onClick={() => attachRun(run)} className={`flex w-full items-center gap-2 rounded-btn px-2 py-1.5 text-left hover:bg-elevated ${task.runId === run.run_id ? 'bg-accent/10' : ''}`}><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${SUCCESS.has(run.status) ? 'bg-success' : ACTIVE.has(run.status) ? 'bg-accent' : 'bg-muted'}`} /><span className="min-w-0 flex-1 truncate font-mono text-[9px] text-secondary">{run.run_id}</span><span className="shrink-0 text-[9px] text-muted">{statusLabel(run.status)}</span></button>)}
+              {(runsQuery.data?.items ?? []).map(run => <button key={run.run_id} type="button" onClick={() => attachRun(run)} className={`flex w-full items-center gap-2 rounded-btn px-2 py-1.5 text-left hover:bg-elevated ${task.runId === run.run_id ? 'bg-accent/10' : ''}`}><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${SUCCESS.has(run.status) ? 'bg-success' : ACTIVE.has(run.status) ? 'bg-accent' : 'bg-muted'}`} />{run.request?.auto && <span className="shrink-0 rounded-btn bg-accent/10 px-1 text-[8px] font-medium text-accent" title="自动挖掘（因子池由统计筛选生成）">自动</span>}<span className="min-w-0 flex-1 truncate font-mono text-[9px] text-secondary">{run.run_id}</span><span className="shrink-0 text-[9px] text-muted">{statusLabel(run.status)}</span></button>)}
               {runsQuery.isError && <div className="text-[9px] text-danger">运行历史加载失败</div>}
               {!runsQuery.isLoading && !runsQuery.isError && !(runsQuery.data?.items.length) && <div className="text-[9px] text-muted">暂无持久运行</div>}
             </div>
@@ -666,6 +778,7 @@ export function MiningWorkbench() {
 
       <section className="min-w-0 bg-surface xl:max-h-[calc(100vh-9rem)] xl:overflow-y-auto">
         <RunStatus run={task.run} progress={task.progress} error={task.error} reconnecting={task.reconnecting} />
+        {task.run?.request?.auto_screening && <AutoScreeningCard screening={task.run.request.auto_screening} />}
         {showingPrevious && <div className="border-b border-warning/30 bg-warning/5 px-3 py-1.5 text-[10px] text-warning">历史结果 · run {result?.run_id}。当前 run {task.runId} {task.isPending ? '仍在执行' : '未成功完成'}，以下内容仅供参考，候选操作已禁用。</div>}
 
         {!result ? (
@@ -750,6 +863,30 @@ export function MiningWorkbench() {
               <button type="button" disabled={realtimeToggle.isPending} onClick={() => { const p = pendingMining; if (!p) return; void realtimeToggle.mutateAsync(false).then(() => { setPendingMining(null); submitMining(p) }) }} className="inline-flex h-8 items-center gap-1.5 rounded-btn bg-accent px-3 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-50">
                 {realtimeToggle.isPending ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
                 关闭实时并开始
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 市场环境覆盖不足的补救确认: 补算缺失区间后自动重跑, 取消则不做任何操作。 */}
+      {regimeBackfill && (
+        <div {...regimeBackdrop} className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div onClick={e => e.stopPropagation()} className="w-full max-w-sm rounded-2xl border border-border bg-surface p-5 shadow-2xl">
+            <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
+              <Database className="h-4 w-4 shrink-0 text-warning" />
+              市场环境数据不完整
+            </div>
+            <p className="mt-2 text-xs leading-5 text-secondary">
+              {regimeBackfill.start
+                ? <>环境数据缺少 <span className="font-mono text-foreground">{regimeBackfill.start}</span> 起的部分交易日，挖掘的 T-1 环境校验未通过。点击确定将自动补算该区间（结束至今日），完成后重新开始挖掘。</>
+                : '尚未计算市场环境数据。点击确定将执行全量计算（历史较长时耗时较久），完成后重新开始挖掘。'}
+            </p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" disabled={regimeRecomputeAndRun.isPending} onClick={() => setRegimeBackfill(null)} className="h-8 rounded-btn border border-border px-3 text-xs text-secondary hover:bg-elevated disabled:opacity-50">取消</button>
+              <button type="button" disabled={regimeRecomputeAndRun.isPending} onClick={() => regimeRecomputeAndRun.mutate(regimeBackfill)} className="inline-flex h-8 items-center gap-1.5 rounded-btn bg-accent px-3 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-50">
+                {regimeRecomputeAndRun.isPending ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Database className="h-3.5 w-3.5" />}
+                补算并重新挖掘
               </button>
             </div>
           </div>
