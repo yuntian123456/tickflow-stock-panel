@@ -95,6 +95,7 @@ class FakeTdxClient:
         bars_get_fn=None,
         series_by_adjust=None,
         depths=None,
+        connect_fail_times=0,
     ):
         self._series = series
         self._factors = factors
@@ -108,6 +109,8 @@ class FakeTdxClient:
         self._series_by_adjust = series_by_adjust
         self._depths = depths or []
         self.depth_calls: list[list[str]] = []
+        self._connect_fail_times = connect_fail_times
+        self.connect_calls = 0
         # eltdx >=3.1.0: bars.all 并入 bars.get(..., all_pages=True)
         self.bars = SimpleNamespace(get=self._bars_get)
         self.quotes = SimpleNamespace(
@@ -130,6 +133,15 @@ class FakeTdxClient:
 
     def __exit__(self, *a):
         return False
+
+    def connect(self):
+        """模拟建连: 前 connect_fail_times 次抛超时, 之后成功(对齐 _connect_with_retry)。"""
+        self.connect_calls += 1
+        if self.connect_calls <= self._connect_fail_times:
+            raise TimeoutError("7709 response timed out during connect")
+
+    def close(self):
+        return None
 
     def _record_kind(self, kwargs):
         if self._kind_log is not None:
@@ -499,8 +511,10 @@ def test_iter_daily_single_batch_with_empty_chunk(fake_eltdx):
     assert df["symbol"].to_list() == ["000001.SZ", "000002.SZ"]
 
 
-def test_iter_daily_multi_batch_progress(fake_eltdx):
-    """超过 _BATCH 的标的集切成多批, 每批一次进度回调, 终点 cur == total。"""
+def test_iter_daily_multi_batch_progress(fake_eltdx, monkeypatch):
+    """超过 _BATCH 的标的集切成多批, 每批一次进度回调, 终点 cur == total;
+    连接复用: 8 worker 全程仅建连一次/worker(而非每批重建)。"""
+    monkeypatch.setattr("app.plugins.eltdx.provider.time.sleep", lambda _s: None)
     fake_eltdx(FakeTdxClient(series=SimpleNamespace(bars=[_bar(datetime(2026, 1, 2, 15, 0), close=10.0)])))
     provider = EltdxProvider()
     progress: list[tuple[int, int]] = []
@@ -517,6 +531,56 @@ def test_iter_daily_multi_batch_progress(fake_eltdx):
     assert len(frames) == 2
     total_rows = sum(f.height for f in frames)
     assert total_rows == 81
+
+
+def test_iter_daily_connect_retry_then_success(fake_eltdx, monkeypatch):
+    """建连前几次超时: 退避重试后成功, 不打断流(软失败语义)。"""
+    monkeypatch.setattr("app.plugins.eltdx.provider.time.sleep", lambda _s: None)
+    fake = FakeTdxClient(
+        series=SimpleNamespace(bars=[_bar(datetime(2026, 1, 2, 15, 0), close=10.0)]),
+        connect_fail_times=2,
+    )
+    fake_eltdx(fake)
+    provider = EltdxProvider()
+    progress: list[tuple[int, int]] = []
+    frames = list(
+        provider.iter_daily(
+            ["000001.SZ"],
+            datetime(2026, 1, 1),
+            datetime(2026, 1, 2, 23, 59),
+            on_chunk_done=lambda cur, tot: progress.append((cur, tot)),
+        )
+    )
+    assert progress == [(1, 1)]
+    assert fake.connect_calls == 3  # 2 次超时 + 第 3 次成功
+    assert frames[0]["symbol"].to_list() == ["000001.SZ"]
+
+
+def test_iter_daily_connect_always_fail_soft_skip(fake_eltdx, monkeypatch):
+    """建连始终失败: 跳过批次(空帧)且进度仍覆盖, 不抛异常打断 pipeline。"""
+    monkeypatch.setattr("app.plugins.eltdx.provider.time.sleep", lambda _s: None)
+    fake_eltdx(FakeTdxClient(series=None, connect_fail_times=99))
+    provider = EltdxProvider()
+    progress: list[tuple[int, int]] = []
+    frames = list(
+        provider.iter_daily(
+            ["000001.SZ", "000002.SZ"],
+            datetime(2026, 1, 1),
+            datetime(2026, 1, 2, 23, 59),
+            on_chunk_done=lambda cur, tot: progress.append((cur, tot)),
+        )
+    )
+    assert frames and all(f.is_empty() for f in frames)
+    assert progress == [(1, 1)]
+
+
+def test_get_daily_connect_fail_soft_empty(fake_eltdx, monkeypatch):
+    """get_daily 路径建连失败同样软失败: 返回空 df 而非抛异常。"""
+    monkeypatch.setattr("app.plugins.eltdx.provider.time.sleep", lambda _s: None)
+    fake_eltdx(FakeTdxClient(series=None, connect_fail_times=99))
+    provider = EltdxProvider()
+    df = provider.get_daily(["000001.SZ"], datetime(2026, 1, 1), datetime(2026, 1, 2, 23, 59))
+    assert df.is_empty()
 
 
 # ---- depth5(五档盘口) ----

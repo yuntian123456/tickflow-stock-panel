@@ -32,8 +32,10 @@ total_hand 同口径(手); update_time_raw 为服务端行情墙钟 HHMMSS, 组�
 from __future__ import annotations
 
 import concurrent.futures as _futures
+import contextlib
 import logging
 import threading as _threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -271,6 +273,26 @@ class EltdxProvider:
 
         return TdxClient(timeout=10)
 
+    def _connect_with_retry(self, attempts: int = 3):
+        """建连(带退避重试): TDX 公共服务器对连接频率敏感, 全市场日K同步与
+        秒级实时轮询叠加时握手偶发超时(ResponseTimeoutError)。1s/2s 退避重试,
+        全部失败抛最后一次异常(由调用方决定软失败或中断)。"""
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            client = self._client()
+            try:
+                client.connect()
+                return client
+            except Exception as e:
+                last_exc = e
+                logger.warning("eltdx 建连失败(第 %d/%d 次): %s", attempt, attempts, e)
+                with contextlib.suppress(Exception):
+                    client.close()
+                if attempt < attempts:
+                    time.sleep(attempt)
+        assert last_exc is not None
+        raise last_exc
+
     def _run_concurrent(self, symbols: list[str], fetch_one, on_chunk_done=None, workers: int | None = None) -> list:
         """静态分片并发拉取: symbols 均分给 worker 个 worker, 每个 worker 建连一次并复用。
 
@@ -305,7 +327,16 @@ class EltdxProvider:
 
         def worker(chunk):
             out: list = []
-            with self._client() as c:
+            # 建连失败软失败(重试后仍失败): 跳过本批而非抛出 —— 一次握手抖动
+            # 不应打死整轮同步(pipeline 全市场日K曾因此整体失败)。
+            try:
+                c = self._connect_with_retry()
+            except Exception as e:
+                logger.warning("eltdx 建连失败, 本批 %d 只跳过: %s", len(chunk), e)
+                for _ in chunk:
+                    tick()
+                return out
+            try:
                 for sym in chunk:
                     try:
                         row = fetch_one(c, sym)
@@ -314,6 +345,9 @@ class EltdxProvider:
                     except Exception as e:
                         logger.warning("eltdx %s 拉取失败: %s", sym, e)
                     tick()
+            finally:
+                with contextlib.suppress(Exception):
+                    c.close()
             return out
 
         results: list = []
@@ -388,16 +422,66 @@ class EltdxProvider:
         内存峰值 = 单批)。按 _BATCH 切片, 批内 _run_concurrent 并发; 进度改为
         本方法按批上报(on_chunk_done(cur, total), 覆盖空批, 流结束 cur == total),
         不再交给批内 _run_concurrent, 避免双重计数。
+
+        连接策略: 每 worker 建连一次贯穿其全部批次 —— 全市场 70 批仅 8 次握手。
+        旧实现每批重建 8 条连接(全市场 ~560 次 connect/disconnect), 与秒级实时
+        轮询叠加触发 TDX 服务器限速, 握手超时(ResponseTimeoutError)直接打死
+        整个 pipeline。单标的失败软处理; 连接级异常重建连接(含重试)后继续,
+        建连重试仍失败则跳过该批, 不打断整轮流。
         """
         if not symbols:
             return
         fetch_one = self._daily_fetcher(start_time, end_time)
-        total = (len(symbols) + _BATCH - 1) // _BATCH
-        for cur, chunk in enumerate(chunked(list(symbols), _BATCH), start=1):
-            frames = self._run_concurrent(list(chunk), fetch_one)
-            yield pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
-            if on_chunk_done:
-                on_chunk_done(cur, total)
+        chunks = [list(c) for c in chunked(list(symbols), _BATCH)]
+        total = len(chunks)
+        n_workers = min(_WORKERS, total)
+        size = max(1, (total + n_workers - 1) // n_workers)
+        slices = [chunks[i : i + size] for i in range(0, total, size)]
+        lock = _threading.Lock()
+        state = {"done": 0}
+
+        def report() -> None:
+            with lock:
+                state["done"] += 1
+                if on_chunk_done:
+                    on_chunk_done(state["done"], total)
+
+        def worker(slice_chunks):
+            frames: list = []
+            c = None
+            try:
+                for chunk in slice_chunks:
+                    if c is None:
+                        try:
+                            c = self._connect_with_retry()
+                        except Exception as e:
+                            logger.warning("eltdx iter_daily 建连失败, 跳过 %d 只: %s", len(chunk), e)
+                            report()
+                            continue
+                    for sym in chunk:
+                        try:
+                            df = fetch_one(c, sym)
+                            if df is not None:
+                                frames.append(df)
+                        except Exception as e:
+                            logger.warning("eltdx %s 日K拉取失败: %s", sym, e)
+                            # 连接级异常: 重建连接, 本批剩余标的随下一批重连后继续
+                            with contextlib.suppress(Exception):
+                                c.close()
+                            c = None
+                            break
+                    report()
+            finally:
+                if c is not None:
+                    with contextlib.suppress(Exception):
+                        c.close()
+            return frames
+
+        with _futures.ThreadPoolExecutor(max_workers=len(slices)) as pool:
+            futures = [pool.submit(worker, s) for s in slices]
+            for fut in _futures.as_completed(futures):
+                frames = fut.result()
+                yield pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
 
     # ---- adj_factor ----
     def get_adj_factors(
