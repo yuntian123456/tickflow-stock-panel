@@ -2,11 +2,8 @@
 
 # 📈 TSP · A股智能量化工作台
 
-**自托管、零运维的 A 股「选股 + 监控 + 回测」量化工作台**
-
-`多数据源能力路由` · `分钟级策略执行` · `全时段异动监控` · `AI 辅助研究`
-
 <br/>
+
 
 [![个人开源](https://img.shields.io/badge/%E4%B8%AA%E4%BA%BA%E5%BC%80%E6%BA%90-green?style=for-the-badge&labelColor=red)](https://github.com/shy3130/tick-stock-panel)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](./LICENSE)
@@ -16,6 +13,16 @@
 
 [![Build: Docker CI](https://github.com/shy3130/tick-stock-panel/actions/workflows/docker.yml/badge.svg)](https://github.com/shy3130/tick-stock-panel/actions/workflows/docker.yml)
 [![GitHub stars](https://img.shields.io/github/stars/shy3130/tick-stock-panel?style=social)](https://github.com/shy3130/tick-stock-panel/stargazers)
+
+
+
+
+**自托管、零运维的 A 股「选股 + 监控 + 回测」量化工作台**
+
+`多数据源能力路由` · `分钟级策略执行` · `全时段异动监控` · `AI 辅助研究`
+
+<a href="https://trendshift.io/repositories/64327?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-64327" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/64327" alt="shy3130%2Ftick-stock-panel | Trendshift" width="250" height="55"/></a>
+<a href="https://trendshift.io/repositories/64327?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-64327" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/64327/daily?language=TypeScript" alt="shy3130%2Ftick-stock-panel | Trendshift" width="250" height="55"/></a>
 
 <br/>
 
@@ -169,31 +176,29 @@
 
 <table>
   <tr>
+    <td width="50%" align="center"><b>看板 Dashboard</b></td>
     <td width="50%" align="center"><b>策略 Screener</b></td>
-    <td width="50%" align="center"><b>回测 Backtest</b></td>
   </tr>
   <tr>
+    <td width="50%"><img src="./screenshots/看板.png" alt="看板页面"></td>
     <td width="50%"><img src="./screenshots/策略.png" alt="策略页"></td>
-    <td width="50%"><img src="./screenshots/回测.png" alt="回测页"></td>
   </tr>
   <tr>
+    <td width="50%" align="center"><b>回测 Backtest</b></td>
     <td width="50%" align="center"><b>挖掘 Mining</b></td>
-    <td width="50%" align="center"><b>监控中心 Monitor</b></td>
   </tr>
   <tr>
+    <td width="50%"><img src="./screenshots/回测.png" alt="回测页"></td>
     <td width="50%"><img src="./screenshots/挖掘因子.png" alt="挖掘页"></td>
-    <td width="50%"><img src="./screenshots/监控中心.png" alt="监控中心"></td>
   </tr>
   <tr>
-    <td width="50%" align="center"><b>异动监控 Abnormal Moves</b></td>
+    <td width="50%" align="center"><b>监控中心 Monitor</b></td>
     <td width="50%" align="center"><b>市场环境 Regime</b></td>
   </tr>
   <tr>
-    <td width="50%"><img src="./screenshots/异动监控.png" alt="异动监控"></td>
+    <td width="50%"><img src="./screenshots/监控中心.png" alt="监控中心"></td>
     <td width="50%"><img src="./screenshots/市场环境分析.png" alt="市场环境分析"></td>
   </tr>
- 
- 
 </table>
 
 <div align="center">
