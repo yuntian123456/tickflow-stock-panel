@@ -52,6 +52,7 @@ export const QK = {
 
   // Backtest
   backtestStatus:       ['backtest-status'] as const,
+  backtestCandidates:   ['backtest-candidates'] as const,
   factorColumns:        ['backtest-factor-columns'] as const,
   factorLibrary:        (assetType: string) => ['factors-library', assetType] as const,
   miningRuns:           ['backtest-mining-runs'] as const,
@@ -104,6 +105,18 @@ export const QK = {
   monitorRuleOptions:   ['monitor-rule-options'] as const,
   lots:                 ['lots'] as const,
   lotsKline:            (symbols: string) => ['lots-kline', symbols] as const,
+
+  // 模拟盘 (多账户: 键按账户隔离; paperAll 作账户无关失效前缀)
+  paperAll:             ['paper'] as const,
+  apiTokens:            ['settings', 'api-tokens'] as const,
+  paperAccounts:        ['paper', 'accounts'] as const,
+  paperOverview:        (acc: string) => ['paper', 'overview', acc] as const,
+  paperOrders:          (acc: string) => ['paper', 'orders', acc] as const,
+  paperTrades:          (acc: string) => ['paper', 'trades', acc] as const,
+  paperNav:             (acc: string) => ['paper', 'nav', acc] as const,
+  paperStats:           (acc: string) => ['paper', 'stats', acc] as const,
+  paperCompare:         ['paper', 'compare'] as const,
+  paperAutoRules:       (acc: string) => ['paper', 'auto-rules', acc] as const,
   alerts:               (source?: string) => ['alerts', source ?? ''] as const,
 
   // AI 大盘复盘
@@ -119,6 +132,14 @@ export const QK = {
   regimeCoverage:       ['regime-coverage'] as const,
   regimePhases:         (start?: string, end?: string) => ['regime-phases', start ?? '', end ?? ''] as const,
   regimeMainline:       (kind: string, start?: string, end?: string) => ['regime-mainline', kind, start ?? '', end ?? ''] as const,
+  // 板块切换 (盘中轮动, 全量分钟聚合) — 30s 前端轮询刷新; seriesKey = 自定义展示板块清单,
+  // filterKey = 自动活跃榜行数与排除名单 (会改变结果的参数必须进查询键)
+  sectorRotation:       (kind: string, flow?: string, bucket?: number, seriesKey?: string, filterKey?: string) => ['sector-rotation', kind, flow ?? '', bucket ?? 5, seriesKey ?? '', filterKey ?? ''] as const,
+  // 板块切换的指数叠加线 (核心四只, 默认上证) — 分钟取当日, 日K取昨收基准
+  sectorRotationIndexMinute: (symbol: string, date?: string) => ['sector-rotation-index-minute', symbol, date ?? ''] as const,
+  sectorRotationIndexDaily:  (symbol: string) => ['sector-rotation-index-daily', symbol] as const,
+  // 扩展表 schema 清单 (板块切换的资金流列选择器等)
+  extSchemaAll:         ['ext-schema-all'] as const,
 } as const
 
 // ===== SSE 应该 invalidate 的 key 前缀列表 =====
@@ -139,4 +160,7 @@ export const SSE_INVALIDATE_PREFIXES = [
   'index-quotes',
   'overview-market',
   'limit-ladder',
+  // 概念/行业分析的全市场快照 (#419): 后端读最新日内缓存, 行情更新后需重取,
+  // 否则停留页面时板块聚合数值一直停留旧值。仅两页打开时才实际发请求。
+  'market-snapshot',
 ] as const

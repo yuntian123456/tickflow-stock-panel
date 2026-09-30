@@ -16,7 +16,7 @@ import polars as pl
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, Field
 
-from app.market_time import CN_TZ
+from app.market_time import CN_TZ, cn_today
 from app.services.ext_data import (
     ExtConfig,
     ExtConfigStore,
@@ -57,6 +57,7 @@ class CreateExtReq(BaseModel):
     description: str = ""
     symbol_map: dict = {}   # {"type": "mapped", "col": "..."} 或 {"type": "computed", "from": "code", "method": "append_exchange"}
     code_map: dict = {}     # {"type": "mapped", "col": "..."} 或 {"type": "computed", "from": "symbol", "method": "strip_exchange"}
+    market_level: bool = False  # 市场级表: 行=全市场每日一条, 无 symbol 列 (如择时状态序列)
 
 
 class UpdateExtReq(BaseModel):
@@ -65,6 +66,7 @@ class UpdateExtReq(BaseModel):
     description: str | None = None
     symbol_map: dict | None = None
     code_map: dict | None = None
+    market_level: bool | None = None
 
 
 class IngestReq(BaseModel):
@@ -97,8 +99,15 @@ class PullConfigReq(BaseModel):
     time_window_end: str | None = None     # "HH:MM", None=不限
     # 接口按日查询的参数名 (如 "date"): 配置后支持历史回补, 且当日拉取也带日期参数
     date_param: str | None = Field(None, min_length=1, max_length=16, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    # 日期参数值的格式: iso/compact/ts_s/ts_ms (时间戳=该交易日北京时间 00:00:00), 缺省 iso
+    date_format: str = "iso"
+    # 日内序列表时间列名 (字段映射后的列名, 如 "ts"): 配置后同 symbol 允许多行,
+    # 按 [symbol, time_field] 去重; 留空 = 每日快照表 (按 symbol 去重)
+    time_field: str | None = Field(None, max_length=32)
     # 鉴权方式; 请求中缺省 (None) = 保留现有配置, {"type":"none"} = 关闭鉴权
     auth: PullAuthReq | None = None
+    # 单次拉取请求超时 (秒), 默认 30 与历史行为一致; 大响应接口可调高
+    timeout_seconds: int = Field(30, ge=5, le=300)
 
 
 class ApiKeyReq(BaseModel):
@@ -114,6 +123,9 @@ class DetectUrlReq(BaseModel):
     body: str | None = None
     response_path: str = ""
     field_map: dict[str, str] | None = None
+    # 探测超时; 与 PullConfig.timeout_seconds 同口径 (默认 30 与历史行为一致),
+    # 大响应接口 (如全量集合竞价 /day ~77s) 探测时需要更高超时
+    timeout_seconds: int = Field(30, ge=5, le=300)
 
 
 # ---------------------------------------------------------------------------
@@ -222,10 +234,21 @@ def _read_ext_dataframe(
     config: ExtConfig,
     data_dir: Path,
     snapshot_date: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> tuple[pl.DataFrame, str | None]:
+    """读取扩展表数据。
+
+    - snapshot: 当前快照 (不支持日期范围)。
+    - timeseries + snapshot_date: 单日分区 (历史行为)。
+    - timeseries + start_date/end_date (可只给一端): 范围内全部分区 concat,
+      active_date 返回 "首..末"。date 与范围同时给出时 date 优先。
+    """
     cfg_dir = data_dir / "ext_data" / config.id
 
     if config.mode == "snapshot":
+        if start_date or end_date:
+            raise HTTPException(400, "快照模式无历史分区, 不支持日期范围查询")
         path = cfg_dir / "part.parquet"
         if not path.exists():
             return pl.DataFrame(), None
@@ -248,6 +271,34 @@ def _read_ext_dataframe(
     )
     if not partitions:
         return pl.DataFrame(), None
+
+    if start_date or end_date:
+        lo = _partition_date(start_date) if start_date else None
+        hi = _partition_date(end_date) if end_date else None
+        if lo and hi and lo > hi:
+            raise HTTPException(400, f"start_date {lo} 晚于 end_date {hi}")
+        # ISO 日期字符串字典序 == 时间序, 分区名直接比较
+        selected = [
+            d for d in partitions
+            if (not lo or d.name[5:] >= lo) and (not hi or d.name[5:] <= hi)
+        ]
+        if not selected:
+            return pl.DataFrame(), None
+        # 每分区补行级日期列 (分区名): 表自带 date 列则用 data_date, 两者都有不再加。
+        # 没有它, 范围合并后消费方无法区分行来自哪一天。
+        frames = []
+        for d in selected:
+            f = pl.read_parquet(d / "part.parquet")
+            day = d.name[5:]
+            if "date" not in f.columns:
+                f = f.with_columns(pl.lit(day).alias("date"))
+            elif "data_date" not in f.columns:
+                f = f.with_columns(pl.lit(day).alias("data_date"))
+            frames.append(f)
+        # diagonal: 各分区 schema 可能不一致 (配置中途加字段 → 早期分区少列),
+        # 缺列自动补 null 并取超类型; 单分区时无需 concat
+        df = pl.concat(frames, how="diagonal") if len(frames) > 1 else frames[0]
+        return df, f"{selected[0].name[5:]}..{selected[-1].name[5:]}"
 
     latest = partitions[-1]
     latest_date = latest.name[5:]
@@ -391,6 +442,7 @@ def create_config(request: Request, body: CreateExtReq):
         description=body.description,
         symbol_map=body.symbol_map,
         code_map=body.code_map,
+        market_level=body.market_level,
     )
     store.upsert(config)
     _refresh_views(request)
@@ -414,6 +466,8 @@ def update_config(request: Request, config_id: str, body: UpdateExtReq):
         config.symbol_map = body.symbol_map
     if body.code_map is not None:
         config.code_map = body.code_map
+    if body.market_level is not None:
+        config.market_level = body.market_level
     store.upsert(config)
     _refresh_views(request)
     return config.to_dict()
@@ -433,6 +487,42 @@ def delete_config(request: Request, config_id: str):
     return {"status": "deleted"}
 
 
+def _apply_row_filters(df: pl.DataFrame, filters: list[str] | None) -> pl.DataFrame:
+    """等值过滤: 每个条目 `field:v1|v2` (值间 OR); 多条目间 AND; 按字符串比较。
+
+    数值列的等值匹配走字符串口径 (1 → "1", 1.0 → "1.0"), 覆盖二开最常见的
+    "维度取值筛选"场景; 区间/模糊匹配暂不做, 留给真实需求出现。
+    """
+    if not filters:
+        return df
+    for entry in filters:
+        field, sep, raw_values = entry.partition(":")
+        field = field.strip()
+        values = [v for v in (raw_values.split("|") if sep else []) if v != ""]
+        if not field or not values:
+            raise HTTPException(400, f"过滤条件格式错误 (应为 字段:值1|值2): {entry}")
+        if field not in df.columns:
+            raise HTTPException(400, f"过滤字段不存在: {field} (可用: {df.columns})")
+        df = df.filter(pl.col(field).cast(pl.Utf8).is_in(values))
+    return df
+
+
+def _apply_row_sort(df: pl.DataFrame, sort: str | None) -> pl.DataFrame:
+    """排序: `field` 升序 / `field:desc` 降序; 未知字段 400。"""
+    if not sort:
+        return df
+    field, _, direction = sort.partition(":")
+    field = field.strip()
+    descending = direction.strip().lower() == "desc"
+    if field not in df.columns:
+        raise HTTPException(400, f"排序字段不存在: {field} (可用: {df.columns})")
+    return df.sort(field, descending=descending, nulls_last=True)
+
+
+# 模块级常量避免 B008 (参数默认值内的函数调用); 语义与行内 Query(...) 完全一致
+_ROW_FILTER_QUERY = Query(None, description="过滤 条件`字段:值1|值2`, 可重复多条 (AND)")
+
+
 @router.get("/{config_id}/rows")
 def list_rows(
     request: Request,
@@ -440,27 +530,39 @@ def list_rows(
     snapshot_date: str | None = Query(None, alias="date"),
     columns: str | None = Query(None, description="逗号分隔的字段列表"),
     limit: int = Query(1000, ge=1, le=20000),
+    offset: int = Query(0, ge=0, le=1_000_000, description="分页偏移 (配合 limit/total)"),
+    filter: list[str] | None = _ROW_FILTER_QUERY,
+    sort: str | None = Query(None, description="排序字段, 降序加 :desc"),
+    start_date: str | None = Query(None, description="时序起始日期 YYYY-MM-DD (含)"),
+    end_date: str | None = Query(None, description="时序结束日期 YYYY-MM-DD (含)"),
 ):
     """读取扩展数据明细。
 
     - snapshot: 返回当前快照。
-    - timeseries: 默认返回最新日期分区，也可通过 date=YYYY-MM-DD 指定。
+    - timeseries: 默认返回最新日期分区; date=YYYY-MM-DD 指定单日;
+      start_date/end_date 取日期范围 (可只给一端), 全部分区合并返回。
+    - filter/sort/offset: 服务端过滤/排序/分页, 二开方无需一次拉全量自行筛。
     """
     config = _store(request).get(config_id)
     if not config:
         raise HTTPException(404, f"配置 '{config_id}' 不存在")
 
     data_dir = _data_dir(request)
-    df, active_date = _read_ext_dataframe(config, data_dir, snapshot_date)
+    df, active_date = _read_ext_dataframe(config, data_dir, snapshot_date, start_date, end_date)
     df = _with_instrument_name(df, data_dir)
+    # 日内序列表: 按时间列升序, 保证分页/截断取到的是最早的盘
+    tf = config.pull.time_field if config.pull else None
+    if tf and tf in df.columns:
+        df = df.sort(tf)
+    df = _apply_row_filters(df, filter)
+    df = _apply_row_sort(df, sort)
+    total = len(df)
+    df = df.slice(offset, limit)
     requested = [c.strip() for c in (columns or "").split(",") if c.strip()]
     if requested:
         keep = [c for c in ["symbol", "code", "name", *requested] if c in df.columns]
         if keep:
             df = df.select(list(dict.fromkeys(keep)))
-    total = len(df)
-    if total > limit:
-        df = df.head(limit)
 
     rows = []
     for row in df.to_dicts():
@@ -472,9 +574,50 @@ def list_rows(
         "mode": config.mode,
         "date": active_date,
         "total": total,
+        "offset": offset,
         "limit": limit,
         "fields": [f.to_dict() for f in config.fields],
         "rows": rows,
+    }
+
+
+@router.get("/{config_id}/values")
+def field_values(
+    request: Request,
+    config_id: str,
+    field: str = Query(..., min_length=1, description="要枚举去重的字段名"),
+    snapshot_date: str | None = Query(None, alias="date"),
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
+):
+    """字段取值枚举 (去重 + 计数, 按出现次数降序)。
+
+    `/rows?filter=` 的配套端点: 二开方先取某字段的候选值做筛选下拉,
+    再带 filter 查明细。日期语义与 /rows 相同 (date 单日 / 范围 / 默认最新)。
+    """
+    config = _store(request).get(config_id)
+    if not config:
+        raise HTTPException(404, f"配置 '{config_id}' 不存在")
+
+    data_dir = _data_dir(request)
+    df, active_date = _read_ext_dataframe(config, data_dir, snapshot_date, start_date, end_date)
+    if field not in df.columns:
+        raise HTTPException(400, f"字段不存在: {field} (可用: {df.columns})")
+    counted = (
+        df.group_by(field).len().sort(["len", field], descending=[True, False]).head(limit)
+    )
+    values = [
+        {"value": _safe_json_value(row[field]), "count": row["len"]}
+        for row in counted.to_dicts()
+    ]
+    return {
+        "id": config.id,
+        "field": field,
+        "date": active_date,
+        "total": df.height,
+        "distinct": df[field].n_unique(),
+        "values": values,
     }
 
 
@@ -589,6 +732,9 @@ def _prev_daily_close(data_dir: Path, target_date: str) -> pl.DataFrame | None:
     return (
         df.with_columns(_bare_symbol_expr().alias("_bare"))
         .select([pl.col("_bare"), pl.col("close").cast(pl.Float64).alias("prev_close")])
+        # 前收 <= 0 / 非有限视为缺失 (否则 close/ref 为 inf, 整个响应 JSON 渲染 500),
+        # 缺失时由调用方退化为当日首根有效分钟 close
+        .filter(pl.col("prev_close").is_finite() & (pl.col("prev_close") > 0))
         .unique(subset=["_bare"], keep="last")
     )
 
@@ -637,7 +783,10 @@ def _dimension_intraday_compute(
     except Exception as exc:  # noqa: BLE001
         logger.warning("dimension-intraday read minute partition failed: %s", exc)
         return {"status": "no_data", "reason": "minute_schema", "date": target, "points": []}
-    bars = bars.drop_nulls(subset=["datetime", "close"])
+    # close <= 0 / 非有限的分钟行无效: 作基准时 pct 为 inf, 作分子时是 -100% 假跌幅
+    bars = bars.drop_nulls(subset=["datetime", "close"]).filter(
+        pl.col("close").cast(pl.Float64).is_finite() & (pl.col("close") > 0)
+    )
     if bars.is_empty():
         return {"status": "no_data", "reason": "minute_empty", "date": target, "points": []}
     bars = bars.with_columns(_bare_symbol_expr().alias("_bare"))
@@ -808,8 +957,9 @@ async def upload_data(
     keep = [c for c in df.columns if c in all_config_cols]
     df = df.select(keep)
 
-    # 解析快照日期
-    snap = date.fromisoformat(snapshot_date) if snapshot_date else date.today()
+    # 解析快照日期: 非法值 400 (与 /rows 同一校验); 缺省按北京日期落盘,
+    # 服务器时区不能决定分区归属 (UTC 容器北京 08:00 前会写进前一天)
+    snap = date.fromisoformat(_partition_date(snapshot_date)) if snapshot_date else cn_today()
 
     rows = write_ext_parquet(df, config, _data_dir(request), snapshot_date=snap)
 
@@ -835,13 +985,15 @@ def ingest_data(request: Request, config_id: str, body: IngestReq):
     configured = {f.name for f in config.fields}
     required = configured - {"symbol"}
     for i, row in enumerate(body.rows):
-        if "symbol" not in row:
+        # 市场级表 (无标的列) 不强制 symbol; 标的表仍要求逐行携带
+        if not config.market_level and "symbol" not in row:
             raise HTTPException(400, f"第 {i + 1} 行缺少 symbol 字段")
         missing = required - set(row.keys())
         if missing:
             raise HTTPException(400, f"第 {i + 1} 行缺少字段: {', '.join(sorted(missing))}")
 
-    snap = date.fromisoformat(body.date) if body.date else date.today()
+    # 同 /upload: 非法日期 400, 缺省按北京日期落盘
+    snap = date.fromisoformat(_partition_date(body.date)) if body.date else cn_today()
 
     rows_written = rows_to_parquet(body.rows, config, _data_dir(request), snapshot_date=snap)
 
@@ -876,7 +1028,10 @@ def configure_pull(request: Request, config_id: str, body: PullConfigReq):
         time_window_start=body.time_window_start,
         time_window_end=body.time_window_end,
         date_param=body.date_param,
+        date_format=body.date_format,
+        time_field=body.time_field,
         auth=body.auth.model_dump() if body.auth else (old_pull.auth if old_pull else None),
+        timeout_seconds=body.timeout_seconds,
         last_run=old_pull.last_run if old_pull else None,
         last_status=old_pull.last_status if old_pull else None,
         last_message=old_pull.last_message if old_pull else None,
@@ -1125,7 +1280,7 @@ async def detect_url(body: DetectUrlReq):
         raise HTTPException(400, "仅支持 GET / POST")
 
     try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=body.timeout_seconds, follow_redirects=True) as client:
             headers = body.headers or {}
             kwargs: dict = {"headers": headers}
             if method == "POST" and body.body:

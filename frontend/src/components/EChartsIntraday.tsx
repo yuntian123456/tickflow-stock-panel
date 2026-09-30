@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import * as echarts from 'echarts'
 import type { ECharts, EChartsOption } from 'echarts'
 import type { MinuteKlineRow, PriceLimitInfo } from '@/lib/api'
-import { computeIntradayAverage, formatMinuteTime, FULL_DAY_TIMES } from '@/lib/intraday-chart'
+import { computeIntradayAverage, formatMinuteTime, FULL_DAY_TIMES, summarizeMinutes, type DailySummary } from '@/lib/intraday-chart'
 import { useChartTheme, type ChartTheme } from '@/lib/theme'
 
 type YMode = 'adaptive' | 'limit'
@@ -21,6 +21,7 @@ interface Props {
   height?: number
   prevClose?: number
   date?: string
+  dailySummary?: DailySummary
   priceLimit?: PriceLimitInfo
   onPriceHover?: (price: number | null) => void
   onPriceDoubleClick?: (price: number, currentPrice: number) => void
@@ -64,6 +65,9 @@ function getLimitPrices(prevClose: number, priceLimit?: PriceLimitInfo): {
 }
 
 function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgPrices: (number | null)[], lineColor: string, areaColor: string, yMode: YMode, ct: ChartTheme, priceLimit?: PriceLimitInfo, showLimitLines = true, showAvgLine = true, priceLines: Props['priceLines'] = []): EChartsOption {
+  // 无涨跌幅标的 (注册制新股上市初期窗口, 后端 no_limit 标记): 不存在可信
+  // 涨跌停带, 自适应/涨跌停两类模式都退化为纯数据对称范围, 也不画涨跌停虚线
+  const limitLinesActive = showLimitLines && !priceLimit?.no_limit
   // 将数据映射到全天时间轴上的正确位置
   const timeIndexMap = new Map(FULL_DAY_TIMES.map((t, i) => [t, i]))
   const closes = new Array(FULL_DAY_TIMES.length).fill(null) as (number | null)[]
@@ -159,13 +163,14 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
         : largest
     ), 0) * 1.05
 
-    if (showLimitLines && yMode === 'limit') {
+    if (limitLinesActive && yMode === 'limit') {
       const { limitUp, limitDown } = getLimitPrices(prevClose, priceLimit)
       const limitDiffUp = limitUp - prevClose
       const limitDiffDown = prevClose - limitDown
       const limitDiff = Math.max(limitDiffUp, limitDiffDown)
-      // 涨跌停模式: Y 轴按实际涨跌停价
-      maxDiff = Math.max(limitDiff, monitoredDiff)
+      // 涨跌停模式: Y 轴按实际涨跌停价, 但不小于实际数据范围 (数据超带 =
+      // 涨跌幅规则不适用或数据异常, 钳制会把曲线推出图外)
+      maxDiff = Math.max(limitDiff, maxDiff, monitoredDiff)
       yMin = prevClose - maxDiff
       yMax = prevClose + maxDiff
       // 加 markLine 标注涨停价和跌停价 (仅虚线, 不显示文字)
@@ -184,17 +189,14 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
         },
       )
     } else {
-      // 自适应模式: Y 轴按实际涨跌幅对称, 但不超出实际涨跌停范围
-      if (showLimitLines) {
-        const { limitUp, limitDown } = getLimitPrices(prevClose, priceLimit)
-        const limitDiff = Math.max(limitUp - prevClose, prevClose - limitDown)
-        maxDiff = Math.min(maxDiff, limitDiff)
-      }
-      if (!showLimitLines && maxDiff > 0) {
+      // 自适应模式: Y 轴按实际涨跌幅对称。不做涨跌停带上限钳制 — 带内数据
+      // maxDiff 本就 ≤ limitDiff (钳制是恒等), 而数据超带时 (无涨跌幅新股/
+      // 数据异常) 钳制会把曲线推出图外 (issue: C沈鼓 分时被夹在 ±10% 内)
+      if (!limitLinesActive && maxDiff > 0) {
         maxDiff *= 1.1
       }
       // 至少保证一个可视范围 (防止数据平时 maxDiff=0)。指数不使用涨跌停范围，最小范围要更紧，否则低波动指数会被压成横线。
-      const minDiff = showLimitLines ? prevClose * 0.01 : prevClose * 0.001
+      const minDiff = limitLinesActive ? prevClose * 0.01 : prevClose * 0.001
       if (maxDiff < minDiff) maxDiff = minDiff
       maxDiff = Math.max(maxDiff, monitoredDiff)
       yMin = prevClose - maxDiff
@@ -299,7 +301,12 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
         type: 'value',
         min: yMin,
         max: yMax,
-        interval: maxDiff || undefined,
+        // 上市首日无 prevClose 时 min/max 为 undefined, scale 避免 value 轴
+        // 默认从 0 锚定把曲线挤到图上部 (有 min/max 时本属性无影响)。
+        // 区间过宽时 (无涨跌幅新股, maxDiff 远超昨收) interval 减半让昨收
+        // 落在刻度上; 正常涨跌停带内保持原 interval 行为
+        scale: true,
+        interval: prevClose != null && maxDiff > prevClose * 0.5 ? maxDiff / 2 : maxDiff || undefined,
         splitArea: { show: false },
         axisLine: { show: false },
         axisTick: { show: false },
@@ -402,6 +409,7 @@ export function EChartsIntraday({
   height = 320,
   prevClose,
   date,
+  dailySummary,
   priceLimit,
   onPriceHover,
   onPriceDoubleClick,
@@ -426,10 +434,11 @@ export function EChartsIntraday({
   // 全日索引 → 数据数组索引 的映射 (ref 避免重建 chart)
   const fullDayToDataIdx = useRef<Map<number, number>>(new Map())
 
-  const [infoIdx, setInfoIdx] = useState(data.length - 1)
+  const [infoIdx, setInfoIdx] = useState(-1)
   const [yMode, setYMode] = useState<YMode>('adaptive')
   const ct = useChartTheme()
   const avgPrices = useMemo(() => computeIntradayAverage(data), [data])
+  const summary = useMemo(() => summarizeMinutes(data), [data])
 
   // 分时线颜色：基于最新价 vs 昨收
   const lastClose = data.length > 0 ? data[data.length - 1].close : null
@@ -439,8 +448,8 @@ export function EChartsIntraday({
   const areaFill = lineIsFlat ? 'rgba(180,180,190,0.40)' : lineIsUp ? 'rgba(199,64,64,0.40)' : 'rgba(34,197,94,0.40)'
 
   useEffect(() => {
-    setInfoIdx(data.length - 1)
-  }, [data.length])
+    setInfoIdx(-1)
+  }, [date])
 
   useEffect(() => {
     const el = containerRef.current
@@ -470,6 +479,7 @@ export function EChartsIntraday({
         const axesInfo = event.axesInfo
         if (!axesInfo) return
         for (const info of Object.values(axesInfo)) {
+          if ((info as any)?.axisDim !== 'x') continue
           const val = (info as any)?.value
           if (val == null) continue
           const fullDayIdx = typeof val === 'number' ? val : -1
@@ -479,6 +489,8 @@ export function EChartsIntraday({
             const d = dataRef.current
             if (dataIdx >= 0 && dataIdx < d.length) {
               onPriceHoverRef.current?.(d[dataIdx].close)
+            } else {
+              onPriceHoverRef.current?.(null)
             }
             return
           }
@@ -486,6 +498,7 @@ export function EChartsIntraday({
       })
 
       chart.on('globalout', () => {
+        setInfoIdx(-1)
         onPriceHoverRef.current?.(null)
       })
 
@@ -518,6 +531,7 @@ export function EChartsIntraday({
 
       chart.setOption(buildOption(data, prevClose, avgPrices, lineColor, areaFill, yMode, ct, priceLimit, showLimitLines, showAvgLine, priceLines), true)
     } else {
+      fullDayToDataIdx.current = new Map()
       chart.clear()
     }
   }, [data, prevClose, height, lineColor, areaFill, yMode, ct, priceLimit, showLimitLines, showAvgLine, priceLines])
@@ -538,8 +552,11 @@ export function EChartsIntraday({
     }
   }, [])
 
-  const d = infoIdx >= 0 && infoIdx < data.length ? data[infoIdx] : null
-  const avg = d != null ? avgPrices[infoIdx] : null
+  const hovered = infoIdx >= 0 && infoIdx < data.length ? data[infoIdx] : null
+  const d = hovered ?? summary
+  const daily = dailySummary?.date === date ? dailySummary : undefined
+  const ohlc = hovered ?? daily ?? summary
+  const avg = d != null ? avgPrices[hovered ? infoIdx : data.length - 1] : null
   const chg = d && prevClose != null ? d.close - prevClose : null
   const isUp = chg != null ? chg > 0 : true
   const isFlat = chg != null ? chg === 0 : false
@@ -575,24 +592,25 @@ export function EChartsIntraday({
       </div>}
       <div style={{ backgroundColor: ct.infoBarBg }}>
         {/* 第一行: 日期 + OHLC */}
-        <div className="flex items-center gap-x-2 px-2 font-mono text-[11px] select-none flex-wrap" style={{ height: 20 }}>
+        <div className="flex items-center gap-x-2 px-2 font-mono text-[11px] select-none flex-wrap" style={{ minHeight: 20 }}>
           {!d && <span className="text-muted">—</span>}
-          {d && (
+          {ohlc && (
             <>
               {date && <span className="text-muted">{date}</span>}
+              <span className="text-muted">{hovered ? `${formatMinuteTime(hovered.datetime)} 分钟` : daily ? '日K（前复权）' : '分时汇总'}</span>
               <span className="text-muted">开</span>
-              <span style={{ color: priceClr }}>{d.open != null ? d.open.toFixed(2) : '—'}</span>
+              <span style={{ color: priceClr }}>{ohlc.open != null ? ohlc.open.toFixed(2) : '—'}</span>
               <span className="text-muted">高</span>
-              <span style={{ color: priceClr }}>{d.high.toFixed(2)}</span>
+              <span style={{ color: priceClr }}>{ohlc.high.toFixed(2)}</span>
               <span className="text-muted">低</span>
-              <span style={{ color: priceClr }}>{d.low.toFixed(2)}</span>
+              <span style={{ color: priceClr }}>{ohlc.low.toFixed(2)}</span>
               <span className="text-muted">收</span>
-              <span style={{ color: priceClr }} className="font-semibold">{d.close.toFixed(2)}</span>
+              <span style={{ color: priceClr }} className="font-semibold">{ohlc.close.toFixed(2)}</span>
             </>
           )}
         </div>
         {/* 第二行: 价格+均价+量+额 */}
-        <div className="flex items-center gap-x-4 px-2 font-mono text-[11px] select-none" style={{ height: 20 }}>
+        <div className="flex flex-wrap items-center gap-x-2 px-2 font-mono text-[11px] select-none" style={{ minHeight: 20 }}>
           {d && (
             <>
               <span className="flex items-center gap-x-1">
@@ -603,9 +621,9 @@ export function EChartsIntraday({
                 <span style={{ display: 'inline-block', width: 14, height: 2, background: THEME.avgLine }} />
                 <span style={{ color: THEME.avgLine }}>{avg != null ? avg.toFixed(2) : '—'}</span>
               </span>}
-              <span className="text-muted">量</span>
+              <span className="text-muted">{hovered ? '量' : '累计量'}</span>
               <span className="text-secondary">{d.volume.toFixed(0)}</span>
-              <span className="text-muted">额</span>
+              <span className="text-muted">{hovered ? '额' : '累计额'}</span>
               <span className="text-secondary">{fmtAmt(d.amount)}</span>
             </>
           )}

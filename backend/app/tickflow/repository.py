@@ -35,6 +35,7 @@ from app.enriched_generation import (
 from app.market_time import cn_today
 from app.parquet import scan_enriched_parquet
 from app.polars_guard import guarded_collect
+from app.services.minute_adjust import apply_minute_adjustment, minute_basis_is_raw
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,22 @@ def replace_with_retry(src: Path, dst: Path, *, attempts: int = 10, delay_s: flo
 def enriched_dirname(asset_type: str) -> str:
     """asset_type → enriched parquet 目录名。ETF 走独立目录, 其余(stock)用日K enriched。"""
     return "kline_etf_enriched" if asset_type == "etf" else "kline_daily_enriched"
+
+
+# 盘中递推状态的最长窗口 (交易日): MA60 部分和 tail(59)、60 日动量 tail(60)
+_LIVE_AGG_WINDOW_BARS = 60
+
+
+def _live_agg_window_start(dates: pl.Series, latest: date, calendar_start: date) -> date:
+    """盘中递推历史窗口起点: 自然日起点与「最近 60 个交易日」起点取较早者。
+
+    自然日 90 天通常含 62~65 个交易日, 但春节/国庆长假前后只有 57~59 个,
+    tail(59)/tail(60) 会取到残缺窗口 (与 get_enriched_history 按交易日计数同理)。
+    """
+    trading = dates.filter(dates <= latest).unique().sort()
+    if trading.len() >= _LIVE_AGG_WINDOW_BARS:
+        return min(calendar_start, trading[-_LIVE_AGG_WINDOW_BARS])
+    return calendar_start
 
 
 def _last_available_rows(df: pl.DataFrame, cutoff: date) -> pl.DataFrame:
@@ -751,6 +768,8 @@ class KlineRepository:
         started = time.perf_counter()
         logger.info("live agg build start: latest=%s", latest)
         start_60d = latest - timedelta(days=90)  # 日历90天 ≈ 60个交易日
+        # EMA12/26、RSI 递推状态的暖机来源; None = 与窗口切片 df_hist 同源 (降级路径)
+        ewm_history: pl.DataFrame | None = None
 
         # 优先使用已有的历史缓存 (避免重复 scan_parquet + compute_indicators)
         if self._enriched_history_cache is not None and not self._enriched_history_cache.is_empty():
@@ -765,8 +784,9 @@ class KlineRepository:
                 needed = [c for c in base_cols if c in hist_all.columns]
                 step = time.perf_counter()
                 logger.info("live agg step start: slice history cache")
+                window_start = _live_agg_window_start(hist_all["date"], latest, start_60d)
                 df_hist = hist_all.select(needed).filter(
-                    (pl.col("date") >= start_60d) & (pl.col("date") <= latest)
+                    (pl.col("date") >= window_start) & (pl.col("date") <= latest)
                 ).sort(["symbol", "date"])
                 logger.info("live agg step done: slice history cache rows=%d (%.2fs)", len(df_hist), time.perf_counter() - step)
 
@@ -784,6 +804,9 @@ class KlineRepository:
                     hist_all.select("date", *existing_state), latest,
                 )
                 agg_a = state_source.select(existing_state)
+                # ema5~ema60 / macd_dea 等状态取自完整历史缓存; _ema12/_ema26 与 RSI 也必须
+                # 同源暖机, 只用 90 天窗口递推会与 macd_dea、盘后全量口径不一致
+                ewm_history = hist_all.select("symbol", "date", "close")
             else:
                 df_hist = pl.DataFrame()
                 agg_a = pl.DataFrame()
@@ -803,11 +826,13 @@ class KlineRepository:
             logger.info("live agg build skipped: empty state (%.2fs)", time.perf_counter() - started)
             return
 
+        ewm_source = df_hist if ewm_history is None else ewm_history
+
         # 单独计算 _ema12 / _ema26 (compute_indicators 内部会 drop 掉)
         step = time.perf_counter()
         logger.info("live agg step start: ema state")
         df_ema = _last_available_rows(
-            df_hist.sort(["symbol", "date"]).with_columns([
+            ewm_source.sort(["symbol", "date"]).with_columns([
                 pl.col("close").ewm_mean(alpha=_ema_alpha(12), adjust=False).over("symbol").alias("_ema12"),
                 pl.col("close").ewm_mean(alpha=_ema_alpha(26), adjust=False).over("symbol").alias("_ema26"),
             ]).select("symbol", "date", "_ema12", "_ema26"),
@@ -820,7 +845,7 @@ class KlineRepository:
         # 单独计算 RSI 状态列 (compute_indicators 内部会 drop 掉)
         step = time.perf_counter()
         logger.info("live agg step start: rsi state")
-        df_rsi_base = df_hist.sort(["symbol", "date"]).with_columns(
+        df_rsi_base = ewm_source.sort(["symbol", "date"]).with_columns(
             pl.col("close").diff().over("symbol").alias("_daily_delta")
         )
         gain = pl.when(pl.col("_daily_delta") > 0).then(pl.col("_daily_delta")).otherwise(0.0)
@@ -917,8 +942,9 @@ class KlineRepository:
                 pl.col("close").tail(19).sum().alias("_boll_partial_sum"),
                 (pl.col("close").tail(19) ** 2).sum().alias("_boll_partial_sq_sum"),
 
-                pl.col("high").tail(59).max().alias("_high_59d"),
-                pl.col("low").tail(59).min().alias("_low_59d"),
+                # 60 日极值为收盘价口径 (与 compute_indicators / 回测矩阵 high_60d 一致)
+                pl.col("close").tail(59).max().alias("_high_59d"),
+                pl.col("close").tail(59).min().alias("_low_59d"),
 
                 # 异动偏离 deviate_3d 用 (与 5d/10d/30d 同语义: 尾部第 N 个收盘)
                 pl.col("close").tail(3).first().alias("_close_3d_ago"),
@@ -936,7 +962,9 @@ class KlineRepository:
                 pl.col("low").tail(8).min().alias("_kdj_8d_low"),
                 pl.col("high").tail(8).max().alias("_kdj_8d_high"),
 
-                pl.col("close").tail(59).len().alias("_window_len"),
+                # 窗口内实际 K 线根数 (≤ 窗口天数): compute_enriched_today 据此把
+                # 历史不足的窗口指标置空, 与全量 rolling(窗口满才出值) 同口径
+                pl.len().alias("_window_len"),
             ])
         )
 
@@ -963,11 +991,14 @@ class KlineRepository:
 
     def _build_live_agg_from_parquet(self, latest: date, start_60d: date) -> tuple[pl.DataFrame, pl.DataFrame]:
         """降级路径: 从 parquet 读取数据并计算指标 (当 _enriched_history_cache 不可用时)。"""
+        from datetime import timedelta
+
         from app.indicators.pipeline import compute_indicators
 
+        # 多读一段自然日, 再按交易日计数确定窗口起点 (长假前后 90 个自然日不足 60 个交易日)
         lf = (
             scan_enriched_parquet(self._enriched_glob)
-            .filter(pl.col("date") >= start_60d)
+            .filter(pl.col("date") >= start_60d - timedelta(days=60))
             .filter(pl.col("date") <= latest)
             .sort(["symbol", "date"])
         )
@@ -980,6 +1011,8 @@ class KlineRepository:
 
         if df_hist.is_empty():
             return df_hist, pl.DataFrame()
+        window_start = _live_agg_window_start(df_hist["date"], latest, start_60d)
+        df_hist = df_hist.filter(pl.col("date") >= window_start)
 
         df_with_indicators = compute_indicators(df_hist)
 
@@ -1190,7 +1223,8 @@ class KlineRepository:
         # 按交易日计数裁剪: 从数据里实际存在的交易日序列取最后 lookback_days 个交易日。
         # 不能用 timedelta(days=N) (自然日), 否则周末/节假日会让窗口只有 ~N×5/7 个交易日,
         # 导致 filter_history 策略的滚动窗口/行号差(_gap)漏算, 与回测结果不一致。
-        trading_dates = cache["date"].unique().sort()
+        # 只数目标日及之前的交易日: 历史日期选股时缓存里还有更晚的交易日
+        trading_dates = cache["date"].filter(cache["date"] <= target_date).unique().sort()
         if len(trading_dates) > lookback_days:
             lookback_start = trading_dates[-(lookback_days + 1)]
         else:
@@ -1244,6 +1278,20 @@ class KlineRepository:
             # 保持旧接口空结果的完整 schema, 非空时沿用请求列校验。
             df = cache.clear() if df.is_empty() else df.select(existing)
         return df.sort(["symbol", "date"])
+
+    def get_enriched_history_span(self) -> tuple[date, date] | None:
+        """内存 enriched 历史缓存的可用日期区间 (含端点); 不可用/预热中返回 None。
+
+        纯读 O(1), 不触发刷新: 调用方 (随行情 tick 反复调用的自选 enriched 端点) 需要
+        区分「预热中」与「日期超窗」, 而 get_enriched_range 对两者都返回 None。
+        """
+        cache = self._enriched_history_cache
+        start = self._enriched_history_start
+        if cache is None or cache.is_empty() or start is None:
+            return None
+        # 历史缓存与最新日缓存同批写入/清空, end 通常即 _enriched_cache_date;
+        # 仅当首次刷新在写 latest 之前中断时缺失, 回退取日期列最大值
+        return start, self._enriched_cache_date or cache["date"].max()
 
     def get_live_agg(self) -> pl.DataFrame:
         """返回盘中实时指标预计算聚合表。如无缓存则懒加载。
@@ -1561,6 +1609,20 @@ class KlineRepository:
         """按资产类型选择分钟K parquet glob。ETF 分钟数据独立存储于 kline_etf_minute。"""
         return self._etf_minute_glob if asset_type == "etf" else self._minute_glob
 
+    def _maybe_adjust_minute(self, df: pl.DataFrame, asset_type: str) -> pl.DataFrame:
+        """原始基准标记开启时应用读取时复权投影 (services/minute_adjust 三层架构)。
+
+        标记未开启 (存量未迁移) 原样返回, 行为与旧版逐字节一致; 投影异常也按原样
+        返回 (fail-open, 与日K缺因子语义一致), 不让复权层破坏数据可用性。
+        """
+        if df.is_empty() or not minute_basis_is_raw(self.store.data_dir):
+            return df
+        try:
+            return apply_minute_adjustment(df, self.store.data_dir, asset_type)
+        except Exception as e:
+            logger.warning("分钟复权投影失败, 按原始数据返回: %s", e)
+            return df
+
     def get_minute(
         self,
         symbol: str,
@@ -1569,12 +1631,13 @@ class KlineRepository:
     ) -> pl.DataFrame:
         """分钟K查询 — Polars scan_parquet + predicate pushdown。"""
         try:
-            return guarded_collect(
+            df = guarded_collect(
                 pl.scan_parquet(self._minute_glob_for(asset_type)).filter(
                     (pl.col("symbol") == symbol)
                     & (pl.col("datetime").dt.date() == trade_date)
                 ).sort("datetime")
             )
+            return self._maybe_adjust_minute(df, asset_type)
         except Exception as e:  # noqa: BLE001
             logger.warning("分钟K查询失败: %s", e)
             return pl.DataFrame()
@@ -1593,12 +1656,13 @@ class KlineRepository:
         if not symbols:
             return pl.DataFrame()
         try:
-            return guarded_collect(
+            df = guarded_collect(
                 pl.scan_parquet(self._minute_glob_for(asset_type)).filter(
                     pl.col("symbol").is_in(symbols)
                     & (pl.col("datetime").dt.date() == trade_date)
                 ).sort(["symbol", "datetime"])
             )
+            return self._maybe_adjust_minute(df, asset_type)
         except Exception as e:  # noqa: BLE001
             logger.warning("批量分钟K查询失败: %s", e)
             return pl.DataFrame()
@@ -1621,7 +1685,7 @@ class KlineRepository:
             lf = pl.scan_parquet(self._minute_glob_for(asset_type))
             available = set(lf.collect_schema().names())
             select_cols = [c for c in ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"] if c in available]
-            return guarded_collect(
+            df = guarded_collect(
                 lf.select(select_cols)
                 .filter(
                     pl.col("symbol").is_in(symbols)
@@ -1631,6 +1695,7 @@ class KlineRepository:
                 .sort(["symbol", "datetime"]),
                 streaming=True,
             )
+            return self._maybe_adjust_minute(df, asset_type)
         except Exception as e:  # noqa: BLE001
             logger.warning("分钟K范围查询失败: %s", e)
             return pl.DataFrame()
@@ -1666,12 +1731,13 @@ class KlineRepository:
             lf = pl.scan_parquet(parts)
             available = set(lf.collect_schema().names())
             select_cols = [c for c in ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"] if c in available]
-            return guarded_collect(
+            df = guarded_collect(
                 lf.select(select_cols)
                 .filter(pl.col("symbol").is_in(symbols))
                 .sort(["symbol", "datetime"]),
                 streaming=True,
             )
+            return self._maybe_adjust_minute(df, asset_type)
         except Exception as e:  # noqa: BLE001
             logger.warning("分钟K按日期查询失败: %s", e)
             return pl.DataFrame()

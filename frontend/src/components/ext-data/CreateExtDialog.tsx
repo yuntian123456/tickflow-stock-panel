@@ -33,6 +33,8 @@ export function CreateExtDialog({ onClose }: { onClose: () => void }) {
   const [label, setLabel] = useState('')
   const [description, setDescription] = useState('')
   const [mode, setMode] = useState<'snapshot' | 'timeseries'>('snapshot')
+  // 市场级表: 行 = 全市场每日一条, 无标的列 (市场环境/情绪指数类), 跳过标的关联
+  const [marketLevel, setMarketLevel] = useState(false)
   const [fields, setFields] = useState<ExtDataField[]>([])
   const [detectedSourceNames, setDetectedSourceNames] = useState<string[]>([])
   const [error, setError] = useState('')
@@ -51,6 +53,7 @@ export function CreateExtDialog({ onClose }: { onClose: () => void }) {
   const [responsePath, setResponsePath] = useState('')
   const [fieldMapStr, setFieldMapStr] = useState('')
   const [schedule, setSchedule] = useState(1440)
+  const [timeoutSec, setTimeoutSec] = useState(30)
   const [savePull, setSavePull] = useState(true)
   const [importNow, setImportNow] = useState(true)
   const [enablePull, setEnablePull] = useState(false)
@@ -113,14 +116,17 @@ export function CreateExtDialog({ onClose }: { onClose: () => void }) {
         id,
         label,
         mode,
-        fields: [
-          { name: 'symbol', dtype: 'string', label: '标的代码' },
-          { name: 'code', dtype: 'string', label: '代码' },
-          ...userF,
-        ],
+        fields: marketLevel
+          ? userF
+          : [
+            { name: 'symbol', dtype: 'string', label: '标的代码' },
+            { name: 'code', dtype: 'string', label: '代码' },
+            ...userF,
+          ],
         description: description.trim() || undefined,
-        symbol_map: submittedSymbolMap,
-        code_map: submittedCodeMap,
+        symbol_map: marketLevel ? {} : submittedSymbolMap,
+        code_map: marketLevel ? {} : submittedCodeMap,
+        market_level: marketLevel,
       })
 
       if (sourceMode === 'url' && (savePull || importNow || enablePull)) {
@@ -135,6 +141,7 @@ export function CreateExtDialog({ onClose }: { onClose: () => void }) {
           field_map: finalFieldMap,
           schedule_minutes: schedule,
           enabled: enablePull,
+          timeout_seconds: Number.isFinite(timeoutSec) && timeoutSec >= 5 && timeoutSec <= 300 ? timeoutSec : 30,
         })
 
         if (importNow) {
@@ -170,7 +177,7 @@ export function CreateExtDialog({ onClose }: { onClose: () => void }) {
     id.trim()
       && label.trim()
       && fields.some((f) => f.name.trim())
-      && matchStatus !== 'none'
+      && (marketLevel || matchStatus !== 'none')
       && (sourceMode !== 'url' || url.trim()),
   )
 
@@ -184,6 +191,15 @@ export function CreateExtDialog({ onClose }: { onClose: () => void }) {
     let status: 'none' | 'partial' | 'full' = 'none'
 
     setDetectedSourceNames(detected.map(f => f.name))
+
+    // 市场级表: 不做标的识别, 直接采认全部检测字段
+    if (marketLevel) {
+      setFields(detected)
+      setSymbolMap({})
+      setCodeMap({})
+      setMatchStatus('full')
+      return
+    }
 
     if (symCands.length === 1 && codeCands.length === 1) {
       sm = { type: 'mapped', col: symCands[0] }
@@ -266,6 +282,7 @@ export function CreateExtDialog({ onClose }: { onClose: () => void }) {
       body: method === 'POST' && body.trim() ? body : undefined,
       response_path: responsePath.trim() || undefined,
       field_map: fieldMap,
+      timeout_seconds: Number.isFinite(timeoutSec) && timeoutSec >= 5 && timeoutSec <= 300 ? timeoutSec : undefined,
     })
       .then((res) => {
         setUrlPreview(res)
@@ -321,7 +338,7 @@ export function CreateExtDialog({ onClose }: { onClose: () => void }) {
         <div className="px-6 pt-5 pb-4">
           <div className="flex items-center justify-between">
             <div>
-              <h3 className="text-base font-semibold text-foreground">新增扩展数据</h3>
+              <h3 className="text-[16px] leading-6 font-semibold text-foreground">新增扩展数据</h3>
               <p className="text-[11px] mt-1 inline-flex items-center gap-1 bg-amber-500/10 text-amber-400 px-2 py-0.5 rounded-md font-medium">
                 接入自有数据，与标的自动关联（第三方接口或 CSV/Excel），支持概念、人气、资金流、舆情、研报评分标签等场景
               </p>
@@ -392,6 +409,31 @@ export function CreateExtDialog({ onClose }: { onClose: () => void }) {
                 )
               })}
             </div>
+
+            {/* 市场级: 行=全市场一条, 无标的列 (择时状态/情绪指数类) */}
+            <label className="mt-2 flex cursor-pointer items-center gap-2 rounded-lg border border-border/60 bg-elevated/40 px-2.5 py-1.5">
+              <input
+                type="checkbox"
+                checked={marketLevel}
+                onChange={e => {
+                  setMarketLevel(e.target.checked)
+                  if (e.target.checked) {
+                    setSymbolMap({})
+                    setCodeMap({})
+                    setMatchStatus('full')
+                  } else {
+                    setMatchStatus('none')
+                  }
+                }}
+                className="h-3.5 w-3.5 shrink-0"
+              />
+              <span className="text-[10px] text-secondary">
+                市场级数据
+                <span className="ml-1 text-muted" title="行 = 全市场每日一条, 无标的代码列。适用于市场环境/情绪指数/择时状态等序列, 跳过标的关联; 通过 /rows 与 /values 接口消费">
+                  每行是全市场一条 (无标的列), 跳过标的关联
+                </span>
+              </span>
+            </label>
           </div>
 
           <div className="grid grid-cols-[1fr_1fr] gap-3">
@@ -449,7 +491,7 @@ export function CreateExtDialog({ onClose }: { onClose: () => void }) {
                 <button
                   onClick={handleDetectUrl}
                   disabled={detecting || !url.trim()}
-                  className="h-8 inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 text-xs font-medium text-base hover:bg-accent/90 disabled:opacity-40 transition-colors"
+                  className="h-8 inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 text-xs font-medium text-white hover:bg-accent/90 disabled:opacity-40 transition-colors"
                 >
                   {detecting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
                   测试识别
@@ -475,6 +517,16 @@ export function CreateExtDialog({ onClose }: { onClose: () => void }) {
                     className="w-full h-8 rounded-lg border border-border bg-base px-2 text-[10px] font-mono text-foreground focus:outline-none focus:border-accent/50"
                   />
                 </div>
+              </div>
+              <div className="w-1/2">
+                <div className="text-[10px] text-muted mb-1">拉取超时（秒 · 大响应接口可调高）</div>
+                <input
+                  type="number" min={5} max={300} step={5}
+                  value={timeoutSec}
+                  onChange={(e) => setTimeoutSec(Number(e.target.value))}
+                  title="测试识别与正式拉取的单次请求超时, 默认 30 秒, 范围 5~300"
+                  className="w-full h-8 rounded-lg border border-border bg-base px-2 text-[10px] font-mono text-foreground focus:outline-none focus:border-accent/50"
+                />
               </div>
               <div className="grid grid-cols-2 gap-2">
                 <div>
@@ -643,7 +695,7 @@ export function CreateExtDialog({ onClose }: { onClose: () => void }) {
                 <div className="text-[11px] text-muted">手动添加字段后即可创建空表结构</div>
                 <button
                   onClick={addField}
-                  className="inline-flex items-center gap-1 rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-base hover:bg-accent/90 transition-colors"
+                  className="inline-flex items-center gap-1 rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white hover:bg-accent/90 transition-colors"
                 >
                   <Plus className="h-3.5 w-3.5" />
                   添加字段
@@ -775,7 +827,7 @@ export function CreateExtDialog({ onClose }: { onClose: () => void }) {
             <button
               onClick={() => create.mutate()}
               disabled={!valid || create.isPending}
-              className="px-5 py-2 rounded-lg bg-accent text-base text-xs font-medium hover:bg-accent/90 disabled:opacity-40 transition-colors shadow-sm shadow-accent/20"
+              className="px-5 py-2 rounded-lg bg-accent text-white text-xs font-medium hover:bg-accent/90 disabled:opacity-40 transition-colors shadow-sm shadow-accent/20"
             >
               {create.isPending ? '创建中…' : '创建'}
             </button>

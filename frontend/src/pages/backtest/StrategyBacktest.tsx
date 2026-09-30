@@ -19,7 +19,9 @@ import { fmtPct, fmtPrice, priceColorClass } from '@/lib/format'
 import { boardTag } from '@/lib/board'
 import { boardTag as boardBadge } from '@/components/stock-table/primitives'
 import { BUILTIN_COLUMNS } from '@/lib/watchlist-columns'
+import { toNavItems } from '@/lib/listNav'
 import { cnSignal } from '@/lib/signals'
+import { useCustomSignalNames } from '@/lib/useCustomSignalNames'
 import { SignalPicker } from '@/components/screener/SignalPicker'
 import { startBacktest, stopBacktest, tryReconnect, useBacktestTask } from '@/lib/backtestTask'
 import { useDataStatus, useCapabilities } from '@/lib/useSharedQueries'
@@ -29,12 +31,13 @@ import { DatePicker } from '@/components/DatePicker'
 import { toast } from '@/components/Toast'
 import { StrategyNavChart } from './charts/StrategyNavChart'
 import { ReturnDistributionChart } from './charts/ReturnDistributionChart'
-import { TradeKlineModal } from './components/TradeKlineModal'
+import { TradeKlineModal, type TradeNavSource } from './components/TradeKlineModal'
 import { PicksSymbolKlineModal } from './components/PicksSymbolKlineModal'
 import { SignalTriggerActions } from '@/components/signals/SignalTriggerActions'
 import { WatchlistGroupMenu } from '@/components/WatchlistAddMenu'
 import { ScoringEditor } from '@/components/ScoringEditor'
 import { strategyResultCandidate } from './researchCandidates'
+import { buildDailyNavItems, buildTradeKeyMap, buildTradesNavItems, type TradeNavItem } from './tradeNav'
 
 const formatDate = (date: Date) => date.toISOString().slice(0, 10)
 const monthsAgo = (months: number) => {
@@ -380,14 +383,7 @@ const statValueColor = (v: number | null | undefined) => {
 }
 
 /** 信号 ID → 可读名称映射 (内置 + 自定义), 供交易记录显示具体触发信号。 */
-function useSignalNames(): Record<string, string> {
-  const customQ = useQuery({ queryKey: QK.customSignals, queryFn: api.customSignalsList })
-  return useMemo(() => {
-    const names: Record<string, string> = {}
-    for (const cs of customQ.data?.signals ?? []) names[`csg_${cs.id}`] = cs.name
-    return names
-  }, [customQ.data])
-}
+const useSignalNames = useCustomSignalNames
 
 function ExitReasonBadge({ reason, signalId, signalNames }: { reason: string; signalId?: string | null; signalNames?: Record<string, string> }) {
   const config: Record<string, { label: string; cls: string }> = {
@@ -430,7 +426,7 @@ function fmtScore(v: number | null | undefined): string {
   return Number(v).toFixed(1)
 }
 
-function DailyTradeChip({ trade, side, strategyName, onClick, signalNames }: { trade: StrategyBacktestTrade; side: 'buy' | 'sell'; strategyName?: string; onClick?: () => void; signalNames?: Record<string, string> }) {
+function DailyTradeChip({ trade, side, strategyName, onClick, signalNames, active }: { trade: StrategyBacktestTrade; side: 'buy' | 'sell'; strategyName?: string; onClick?: () => void; signalNames?: Record<string, string>; active?: boolean }) {
   const isBuy = side === 'buy'
   const tag = boardTag(trade.symbol)
   const price = isBuy ? trade.entry_price : trade.exit_price
@@ -444,7 +440,7 @@ function DailyTradeChip({ trade, side, strategyName, onClick, signalNames }: { t
   return (
     <button type="button" onClick={onClick} className={`inline-flex ${isBuy ? 'w-[14.5rem]' : 'w-[14.5rem]'} flex-col gap-0.5 rounded-btn border px-1.5 py-1 text-left text-[11px] leading-4 transition-colors hover:border-accent/45 hover:bg-elevated/60 focus:outline-none focus:ring-1 focus:ring-accent/40 ${
       isBuy ? 'border-accent/25 bg-accent/5' : 'border-border/70 bg-base/45'
-    }`}>
+    } ${active ? 'ring-2 ring-accent/60' : ''}`}>
       <span className="flex items-center gap-1">
         <span className={`shrink-0 rounded px-1 py-px text-[9px] font-medium ${
           isBuy ? 'bg-accent/15 text-accent' : 'bg-elevated text-secondary'
@@ -690,7 +686,7 @@ function Stat({ label, value, color }: { label: ReactNode; value: string; color?
     <div className="min-w-0 rounded-btn border border-border/70 bg-elevated/70 px-3 py-2">
       <div className="text-[11px] text-secondary">{label}</div>
       <div
-        className={`mt-1 break-words font-mono font-semibold leading-tight tracking-tight num ${compact ? 'text-xs xl:text-sm' : 'text-sm xl:text-base'}`}
+        className={`mt-1 break-words font-mono font-semibold leading-tight tracking-tight num ${compact ? 'text-xs xl:text-sm' : 'text-sm xl:text-[16px] xl:leading-6'}`}
         style={{ color: color ?? 'inherit' }}
         title={value}
       >
@@ -1046,11 +1042,12 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
   const [tradePageSize, setTradePageSize] = useState(10)
   /** 回测K线覆盖层: 单笔交易回放 / 标的全区间回放, 由 union 保证至多开一个 */
   const [chartOverlay, setChartOverlay] = useState<
-    | { kind: 'trade'; trade: StrategyBacktestTrade }
+    | { kind: 'trade'; trade: StrategyBacktestTrade; source: TradeNavSource }
     | { kind: 'symbol'; symbol: string }
     | null
   >(null)
   const selectedTrade = chartOverlay?.kind === 'trade' ? chartOverlay.trade : null
+  const tradeNavSource = chartOverlay?.kind === 'trade' ? chartOverlay.source : null
   const picksSymbol = chartOverlay?.kind === 'symbol' ? chartOverlay.symbol : null
   const loadedStrategyRef = useRef<string | null>(null)
 
@@ -1449,6 +1446,35 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
     })
     return names
   }, [result?.trades])
+
+  // 选股分析弹窗的切标的候选 (与表格同序, 保证计数与「上一只/下一只」一致)
+  const picksNavItems = useMemo(
+    () => toNavItems(result?.per_symbol_stats ?? []),
+    [result?.per_symbol_stats],
+  )
+
+  // ===== 单笔回放的切交易链 =====
+  const tradeKeyByIdx = useMemo(() => buildTradeKeyMap(result?.trades ?? []), [result?.trades])
+  const tradesNavItems = useMemo(
+    () => buildTradesNavItems(sortedTrades, tradeKeyByIdx),
+    [sortedTrades, tradeKeyByIdx],
+  )
+  const dailyNavItems = useMemo(
+    () => buildDailyNavItems(dailyTradeRows, tradeKeyByIdx),
+    [dailyTradeRows, tradeKeyByIdx],
+  )
+
+  // 当前弹窗所属的链: 两个入口各自独立, 与点进来的那张表一一对应
+  const tradeNavItems = tradeNavSource === 'daily' ? dailyNavItems : tradeNavSource === 'trades' ? tradesNavItems : []
+  const activeTradeKey = selectedTrade ? tradeKeyByIdx.get(selectedTrade) ?? null : null
+
+  const handleTradeNav = (item: TradeNavItem) => {
+    if (!tradeNavSource) return
+    // 同步翻页: 让下表停在这一笔所在的页, 免得弹窗切了、表格还停在别处
+    if (tradeNavSource === 'daily') setDailyPage(Math.floor(item.rowIdx / dailyPageSize))
+    else setTradePage(Math.floor(item.rowIdx / tradePageSize))
+    setChartOverlay({ kind: 'trade', trade: item.trade, source: tradeNavSource })
+  }
 
   const detail = strategyDetail.data
   const matrixStrategy = detail?.execution_backend === 'matrix_native'
@@ -2444,7 +2470,7 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
                               ) : (
                                 <div className="flex flex-wrap gap-1.5">
                                   {row.buys.map((t, i) => (
-                                    <DailyTradeChip key={`buy-${t.symbol}-${t.entry_date}-${t.exit_date}-${i}`} trade={t} side="buy" strategyName={result?.strategy_info?.name ?? selectedStrategyName} onClick={() => setChartOverlay({ kind: 'trade', trade: t })} signalNames={signalNames} />
+                                    <DailyTradeChip key={`buy-${t.symbol}-${t.entry_date}-${t.exit_date}-${i}`} trade={t} side="buy" strategyName={result?.strategy_info?.name ?? selectedStrategyName} onClick={() => setChartOverlay({ kind: 'trade', trade: t, source: 'daily' })} signalNames={signalNames} active={t === selectedTrade} />
                                   ))}
                                 </div>
                               )}
@@ -2455,7 +2481,7 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
                               ) : (
                                 <div className="flex flex-wrap gap-1.5">
                                   {row.sells.map((t, i) => (
-                                    <DailyTradeChip key={`sell-${t.symbol}-${t.entry_date}-${t.exit_date}-${i}`} trade={t} side="sell" onClick={() => setChartOverlay({ kind: 'trade', trade: t })} signalNames={signalNames} />
+                                    <DailyTradeChip key={`sell-${t.symbol}-${t.entry_date}-${t.exit_date}-${i}`} trade={t} side="sell" onClick={() => setChartOverlay({ kind: 'trade', trade: t, source: 'daily' })} signalNames={signalNames} active={t === selectedTrade} />
                                   ))}
                                 </div>
                               )}
@@ -2520,17 +2546,19 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
                         {visibleTrades.map((t: StrategyBacktestTrade, i: number) => (
                           <tr
                             key={`${t.symbol}-${t.entry_date}-${tradeStart + i}`}
-                            onClick={() => setChartOverlay({ kind: 'trade', trade: t })}
+                            onClick={() => setChartOverlay({ kind: 'trade', trade: t, source: 'trades' })}
                             onKeyDown={(e) => {
                               if (e.key === 'Enter' || e.key === ' ') {
                                 e.preventDefault()
-                                setChartOverlay({ kind: 'trade', trade: t })
+                                setChartOverlay({ kind: 'trade', trade: t, source: 'trades' })
                               }
                             }}
                             role="button"
                             tabIndex={0}
                             title="点击查看该笔交易的K线回放"
-                            className="border-t border-border hover:bg-elevated/50 transition-colors group cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 focus-visible:ring-inset"
+                            className={`border-t border-border hover:bg-elevated/50 transition-colors group cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 focus-visible:ring-inset ${
+                              t === selectedTrade ? 'bg-accent/10' : ''
+                            }`}
                           >
                             <td className="px-4 py-2.5">
                               <div className="font-medium text-foreground transition-colors group-hover:text-accent">
@@ -2637,7 +2665,9 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
                           role="button"
                           tabIndex={0}
                           title="点击查看该标的在回测期的K线 (标注每次买卖)"
-                          className="border-t border-border hover:bg-elevated/50 transition-colors group cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 focus-visible:ring-inset"
+                          className={`border-t border-border hover:bg-elevated/50 transition-colors group cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 focus-visible:ring-inset ${
+                            r.symbol === picksSymbol ? 'bg-accent/10' : ''
+                          }`}
                         >
                           <td className="px-4 py-2">
                             <div className="font-medium text-foreground transition-colors group-hover:text-accent">
@@ -3070,12 +3100,20 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
         </>
       )}
 
-      <TradeKlineModal trade={selectedTrade} onClose={() => setChartOverlay(null)} />
+      <TradeKlineModal
+        trade={selectedTrade}
+        navItems={tradeNavItems}
+        currentKey={activeTradeKey}
+        onNavigate={handleTradeNav}
+        onClose={() => setChartOverlay(null)}
+      />
       <PicksSymbolKlineModal
         symbol={picksSymbol}
         result={result}
         periodStart={resultStartDate}
         periodEnd={resultEndDate}
+        navList={picksNavItems}
+        onNavigate={(sym) => setChartOverlay({ kind: 'symbol', symbol: sym })}
         onClose={() => setChartOverlay(null)}
       />
     </div>

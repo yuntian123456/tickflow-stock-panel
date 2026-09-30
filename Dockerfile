@@ -2,9 +2,9 @@
 # 可选:构建网络无法直连官方源时,传入 --build-arg USE_CN_MIRROR=1 启用国内镜像
 # 可选:stock-sdk 插件默认不打包(它抓取第三方财经网站接口,存在版权与反爬风险)。
 #       如确需启用,传入 --build-arg INCLUDE_STOCKSDK=1 显式开启,使用风险自负。
-# self-plugin: eltdx 插件默认打包(INCLUDE_ELTDX=1), 运行期自动安装其依赖。
 ARG USE_CN_MIRROR=1
 ARG INCLUDE_STOCKSDK=0
+# self-plugin: eltdx 插件默认打包(INCLUDE_ELTDX=1), 运行期自动安装其依赖。
 ARG INCLUDE_ELTDX=1
 ARG NPM_REGISTRY=https://registry.npmmirror.com
 ARG PYPI_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple

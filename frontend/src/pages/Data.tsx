@@ -678,7 +678,7 @@ export function Data() {
         }
       />
 
-      <div className="px-8 py-6 space-y-6 max-w-6xl">
+      <div className="mx-auto px-8 py-6 space-y-6 max-w-6xl">
         {/* 无 Key 提示 —— 非阻断: 历史日K走免费通道, 实时等能力取决于所选数据源 */}
         {isNoKey && (
           <div className="flex items-center gap-2 rounded-card border border-border bg-elevated/40 px-3 py-2 text-xs">
@@ -1149,7 +1149,7 @@ export function Data() {
                 <button
                   onClick={() => syncIndexDaily.mutate()}
                   disabled={!hasDailyBatchCap || !!activeJobId || syncIndexDaily.isPending}
-                  className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-btn bg-accent/90 text-base text-xs font-medium hover:bg-accent disabled:opacity-40 disabled:pointer-events-none transition-colors duration-150"
+                  className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-btn bg-accent/90 text-white text-xs font-medium hover:bg-accent disabled:opacity-40 disabled:pointer-events-none transition-colors duration-150"
                 >
                   {syncIndexDaily.isPending ? (
                     <>
@@ -1225,7 +1225,7 @@ export function Data() {
                 <button
                   onClick={() => stopSync.mutate()}
                   disabled={stopSync.isPending}
-                  className="px-3 py-1.5 rounded-btn bg-danger/90 text-base text-sm font-medium hover:bg-danger disabled:opacity-50 transition-colors"
+                  className="px-3 py-1.5 rounded-btn bg-danger/90 text-white text-sm font-medium hover:bg-danger disabled:opacity-50 transition-colors"
                 >
                   {stopSync.isPending ? '停止中…' : '确认停止'}
                 </button>
@@ -1289,7 +1289,7 @@ export function Data() {
                 <button
                   onClick={() => clearData.mutate()}
                   disabled={clearData.isPending}
-                  className="px-3 py-1.5 rounded-btn bg-danger/90 text-base text-sm font-medium hover:bg-danger disabled:opacity-50 transition-colors"
+                  className="px-3 py-1.5 rounded-btn bg-danger/90 text-white text-sm font-medium hover:bg-danger disabled:opacity-50 transition-colors"
                 >
                   {clearData.isPending ? '清除中…' : '清除数据'}
                 </button>
