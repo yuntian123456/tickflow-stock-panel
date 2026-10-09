@@ -6,6 +6,7 @@ import { motion, AnimatePresence } from 'framer-motion'
 import { Trash2, RefreshCw, Star, X, Search, LayoutGrid, List, Rows3, BarChart3, Settings2, Plus, Check, Filter, Eye, EyeOff, Minus, ChevronsUp, Clock, RotateCcw, FileUp, FolderOpen, FolderMinus, FolderPlus } from 'lucide-react'
 import { api, type KlineRow, type MinuteKlineRow, type WatchlistGroup, type WatchlistGroupColor } from '@/lib/api'
 import { fetchMinuteBatchIncremental } from '@/lib/minuteBatchIncremental'
+import { extendMinuteTail } from '@/lib/minuteTailExtend'
 import { QK } from '@/lib/queryKeys'
 import { storage } from '@/lib/storage'
 import { fmtPrice, fmtPct, fmtBigNum, priceColorClass, formatExtNumber } from '@/lib/format'
@@ -785,6 +786,7 @@ export function Watchlist() {
   const list = useQuery({
     queryKey: QK.watchlist,
     queryFn: api.watchlistList,
+    staleTime: 30_000,  // 清单慢变 (增删后 mutation 会失效), 减少切页重拉
   })
 
   const groupList = useQuery({
@@ -814,15 +816,21 @@ export function Watchlist() {
     enabled: (list.data?.symbols.length ?? 0) > 0,
   })
 
-  const symbols = enriched.data?.rows?.map((r: any) => r.symbol) ?? []
-  const symbolsKey = symbols.join(',')
-
+  // symbol 派生只依赖 enriched.data: 旧写法 symbols 每次渲染都是新引用 (击穿 memo)
+  // 且 filter×find 为 O(n²), 实时行情每 tick 重渲染时放大为每秒全量比较。
   // 指数无本地分钟K数据, 分时批量请求剔除指数 symbol (省请求, 避免逐只 404)
-  const minuteSymbols = useMemo(
-    () => symbols.filter((s: string) => (enriched.data?.rows ?? []).find((r: any) => r.symbol === s)?.asset_type !== 'index'),
-    [symbols, enriched.data],
-  )
-  const minuteSymbolsKey = minuteSymbols.join(',')
+  const enrichedRows = enriched.data?.rows
+  const { symbols, symbolsKey, minuteSymbols, minuteSymbolsKey } = useMemo(() => {
+    const rows = enrichedRows ?? []
+    const syms = rows.map((r: any) => r.symbol)
+    const nonIndex = rows.filter((r: any) => r.asset_type !== 'index').map((r: any) => r.symbol)
+    return {
+      symbols: syms,
+      symbolsKey: syms.join(','),
+      minuteSymbols: nonIndex,
+      minuteSymbolsKey: nonIndex.join(','),
+    }
+  }, [enrichedRows])
 
   // 实时行情状态 (提前到此处: 分时轮询判断需要 realtimeRunning)
   const quoteStatus = useQuoteStatus()
@@ -834,6 +842,9 @@ export function Watchlist() {
     queryFn: () => api.klineDailyBatch(symbols, candleDays),
     enabled: dailyKVisible && symbols.length > 0 && !groupCardsOpen,
     staleTime: 5 * 60_000,  // 5 分钟内不重请求
+    // 改蜡烛天数/增删自选时沿用上一份批量数据 (按 symbol 查表渲染, 旧键不会被读到),
+    // 避免整列蜡烛闪空 — 与 Screener 批量查询同款
+    placeholderData: (prev: any) => prev,
   })
 
   // 当日蜡烛实时修补: 历史 K 线按 staleTime 周期拉取 (见 queryKeys 注释), 最后一根
@@ -888,54 +899,28 @@ export function Watchlist() {
     // 跳动, 轮询降为 30s 兜底校准; tick 断流时回到用户设定间隔
     refetchInterval: () => {
       if (!(intradayRefreshEnabled && realtimeRunning)) return false
+      // 非连续竞价时段 (盘后/周末/节假日) 分钟K不可变, 降为 60s 兜底而非按用户间隔空转;
+      // 字段缺失 (旧后端) 时保持原行为
+      if (quoteStatus.data?.is_trading_hours === false) return 60_000
       const tickFresh = Date.now() - enriched.dataUpdatedAt < 10_000
       return tickFresh ? 30_000 : intradayRefreshInterval * 1000
     },
+    placeholderData: (prev: any) => prev,
   })
 
   // 分时图 SSE 续画: enriched 行情列每 tick 刷新 (SSE 触发), 前端本地续写分钟序列
   // 的最后一根 / 分钟滚动追加新K — 轮询间隔内分时图也随实时价跳动, 零额外请求。
   // 纯视图叠加不写回缓存: 轮询拉回的服务端定版K始终是权威值, 覆盖续画值。
+  // 新鲜度守卫 (见 extendMinuteTail): 只对行情日期为当日的资产类型续画 — ETF
+  // 未开实时拉取时 enriched close 是旧日K回退值, 拼到当日分钟K尾部会画错价。
   const minuteData = useMemo(() => {
-    const base: Record<string, MinuteKlineRow[]> = intradayVisible ? (minuteBatch.data?.data ?? {}) : {}
-    const liveRows = enriched.data?.rows
-    if (!intradayVisible || !liveRows?.length) return base
-    const liveBySymbol = new Map<string, any>(liveRows.map((r: any) => [r.symbol, r]))
-    // 仅连续竞价时段续画 (9:31-11:30, 13:01-15:00); 收盘后 rt_price 即收盘价无需续写
-    const now = new Date()
-    const hh = now.getHours(), mm = now.getMinutes()
-    const inSession =
-      (hh === 9 && mm >= 31) || hh === 10 ||
-      (hh === 11 && mm <= 30) || (hh === 13 && mm >= 1) || hh === 14
-    if (!inSession) return base
-    // 与服务端同构的 naive 北京时间戳 (手工拼本地时间, 不能用 toISOString — 那是 UTC)
-    const pad = (n: number) => String(n).padStart(2, '0')
-    const barTs = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(hh)}:${pad(mm)}:00`
-    const patched: Record<string, MinuteKlineRow[]> = {}
-    for (const sym of Object.keys(base)) {
-      const arr = base[sym]
-      if (!Array.isArray(arr) || arr.length === 0) { patched[sym] = arr; continue }
-      const live = liveBySymbol.get(sym)
-      const price = live?.rt_price ?? live?.close
-      if (typeof price !== 'number' || !Number.isFinite(price)) { patched[sym] = arr; continue }
-      const last = arr[arr.length - 1]
-      if (last.datetime === barTs) {
-        patched[sym] = [...arr.slice(0, -1), {
-          ...last,
-          close: price,
-          high: Math.max(last.high, price),
-          low: Math.min(last.low, price),
-        }]
-      } else if (barTs > last.datetime) {
-        patched[sym] = [...arr, {
-          datetime: barTs, open: price, high: price, low: price, close: price,
-          volume: 0, amount: 0,   // 量/额由下一轮轮询定版覆盖
-        }]
-      } else {
-        patched[sym] = arr   // 轮询数据已新于本地时钟 (钟差兜底), 不动
-      }
-    }
-    return patched
+    if (!intradayVisible) return {}
+    return extendMinuteTail(
+      minuteBatch.data?.data ?? {},
+      enriched.data?.rows,
+      enriched.data?.dates,
+      new Date(),
+    )
   }, [intradayVisible, minuteBatch.data, enriched.data])
 
   const addMutation = useMutation({
