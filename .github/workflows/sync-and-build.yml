@@ -58,11 +58,18 @@ jobs:
         id: vars
         run: |
           # 读取根目录 VERSION 文件并过滤换行符与空格
-          if [ -f "VERSION" ] && [ -s "VERSION" ]; then
-            APP_VER=$(cat VERSION | tr -d '\r\n ')
-          else
-            APP_VER="latest"
+          if [ ! -f "VERSION" ] || [ ! -s "VERSION" ]; then
+            echo "错误：未找到 VERSION 文件或文件为空，无法生成版本标签。"
+            exit 1
           fi
+
+          APP_VER=$(cat VERSION | tr -d '\r\n ')
+
+          if [ -z "$APP_VER" ]; then
+            echo "错误：VERSION 文件内容为空，无法生成版本标签。"
+            exit 1
+          fi
+
           echo "app_version=${APP_VER}" >> $GITHUB_OUTPUT
           echo "读取到的项目版本号为: ${APP_VER}"
 
@@ -96,9 +103,8 @@ jobs:
           build-args: |
             INCLUDE_STOCKSDK=1
             USE_CN_MIRROR=0
-          # 仅推送两个标签：latest 以及来自 VERSION 文件的版本号（如 1.2.0）
+          # 仅推送来自 VERSION 文件的版本号标签（如 1.2.0），不推送 latest
           tags: |
-            ${{ secrets.DOCKER_USERNAME }}/tickflow-stock-panel:latest
             ${{ secrets.DOCKER_USERNAME }}/tickflow-stock-panel:${{ steps.vars.outputs.app_version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
