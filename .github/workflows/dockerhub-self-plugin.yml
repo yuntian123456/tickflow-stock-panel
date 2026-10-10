@@ -76,5 +76,6 @@ jobs:
           # 仅推送「版本号-plugin」tag (如 v0.1.88-plugin)
           tags: |
             ${{ secrets.DOCKER_USERNAME }}/tickflow-stock-panel:${{ steps.vars.outputs.app_version }}
+            ${{ secrets.DOCKER_USERNAME }}/tickflow-stock-panel:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
