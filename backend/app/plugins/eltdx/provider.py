@@ -130,7 +130,7 @@ def _ex_events_from_server_qfq(c, symbol: str, window_days: int | None) -> list[
     try:
         raw = _closes("none")
         qfq = _closes("qfq")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning("eltdx %s 服务端复权推导失败: %s", symbol, e)
         return []
     rows: list[dict] = []
@@ -301,7 +301,7 @@ class EltdxProvider:
             try:
                 client.connect()
                 return client
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 last_exc = e
                 logger.warning("eltdx 建连失败(第 %d/%d 次): %s", attempt, attempts, e)
                 with contextlib.suppress(Exception):
@@ -349,7 +349,7 @@ class EltdxProvider:
             # 不应打死整轮同步(pipeline 全市场日K曾因此整体失败)。
             try:
                 c = self._connect_with_retry()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning("eltdx 建连失败, 本批 %d 只跳过: %s", len(chunk), e)
                 for _ in chunk:
                     tick()
@@ -360,7 +360,7 @@ class EltdxProvider:
                         row = fetch_one(c, sym)
                         if row is not None:
                             out.append(row)
-                    except Exception as e:
+                    except Exception as e:  # noqa: BLE001
                         logger.warning("eltdx %s 拉取失败: %s", sym, e)
                     tick()
             finally:
@@ -472,7 +472,7 @@ class EltdxProvider:
                     if c is None:
                         try:
                             c = self._connect_with_retry()
-                        except Exception as e:
+                        except Exception as e:  # noqa: BLE001
                             logger.warning("eltdx iter_daily 建连失败, 跳过 %d 只: %s", len(chunk), e)
                             report()
                             continue
@@ -481,7 +481,7 @@ class EltdxProvider:
                             df = fetch_one(c, sym)
                             if df is not None:
                                 frames.append(df)
-                        except Exception as e:
+                        except Exception as e:  # noqa: BLE001
                             logger.warning("eltdx %s 日K拉取失败: %s", sym, e)
                             # 连接级异常: 重建连接, 本批剩余标的随下一批重连后继续
                             with contextlib.suppress(Exception):
@@ -644,7 +644,7 @@ class EltdxProvider:
                 df = pl.read_parquet(p, columns=["symbol"])
                 if not df.is_empty():
                     out = set(df["symbol"].cast(pl.Utf8).to_list())
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning("eltdx 读取 %s 受管集合失败: %s", dirname, e)
             out = set()
         self._managed_cache[dirname] = out
@@ -729,7 +729,7 @@ class EltdxProvider:
             for batch in out_all:
                 merged.extend(batch)
             return merged
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning("eltdx realtime 拉取失败: %s", e)
             return []
 
@@ -858,7 +858,7 @@ class EltdxProvider:
                         if s:
                             item["ext"].update(s)
                 return items
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning("eltdx instruments 拉取失败: %s", e)
             return []
 
@@ -873,7 +873,7 @@ class EltdxProvider:
         for chunk in chunked(full_codes, _FINANCE_BATCH):
             try:
                 batch = c.corporate.finance_batch(list(chunk), fields=["流通股本", "总股本"])
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning("eltdx finance_batch 失败(跳过该批): %s", e)
                 continue
             for rec in batch or []:

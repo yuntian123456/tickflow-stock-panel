@@ -248,7 +248,9 @@ export function SectorRotationCard({ kind }: { kind: 'concept' | 'industry' }) {
       excludeSectors: rowsMode === 'custom' || excludeNames === null ? undefined : excludeNames,
       sortBy: rowsMode === 'custom' ? undefined : rowsMode,
     }),
-    refetchInterval: 30_000,
+    // 非连续竞价时段 (回放日期/盘前/盘后) 轮动矩阵不变, 降为 5 分钟兜底;
+    // 开盘后间隔函数随下次调度自动回到 30s (phase 计算与 isMarketSessionNow 同源)
+    refetchInterval: () => (isMarketSessionNow() ? 30_000 : 300_000),
     staleTime: 25_000,
   })
   const data = rotationQuery.data
@@ -691,6 +693,12 @@ export function SectorRotationCard({ kind }: { kind: 'concept' | 'industry' }) {
 
   const latest = data?.timeline?.[data.timeline.length - 1]
   const heatHeight = Math.max(180, heatRows * HEAT_ROW_HEIGHT + 62)
+
+  // 未开启全量分钟落盘时整卡隐藏 (整卡空态占位过大, 白占首屏);
+  // 其余 reason (当日数据为空/成分缺失) 属"有能力缺数据", 保留引导文案
+  if (data && data.status !== 'ok' && data.reason === 'minute_missing') {
+    return null
+  }
 
   return (
     <section className="rounded-2xl border border-border bg-surface p-2.5">

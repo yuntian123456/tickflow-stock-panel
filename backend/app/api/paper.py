@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -119,6 +120,15 @@ def create_account(request: Request, body: AccountModel):
     return {"account": acc}
 
 
+@router.delete("/account")
+def delete_account(request: Request, force: bool = False, account: str = Query(paper.DEFAULT_ACCOUNT_ID)):
+    """删除账户及其全部数据 (不可恢复)。仍有持仓或待成交订单时须 force=true。"""
+    result, err = paper.delete_account(_data_dir(request), _acc(request, account), force=force)
+    if err:
+        raise HTTPException(status_code=400 if "force" in (err or "") else 404, detail=err)
+    return {"ok": True, "deleted": _acc(request, account), **(result or {})}
+
+
 @router.get("/overview")
 def overview(request: Request, account: str = Query(paper.DEFAULT_ACCOUNT_ID)):
     """总览: 现金 + 持仓估值 + 账户状态。
@@ -210,13 +220,39 @@ def get_stats(request: Request, account: str = Query(paper.DEFAULT_ACCOUNT_ID)):
     return paper.stats(_data_dir(request), _acc(request, account))
 
 
+@router.get("/rounds")
+def list_rounds(request: Request, account: str = Query(paper.DEFAULT_ACCOUNT_ID)):
+    """FIFO 配对回合明细 (开平日期/数量/盈亏/持有天数), 供账户面板流水展示。"""
+    return {"rounds": paper.round_trips(_data_dir(request), _acc(request, account))}
+
+
 @router.get("/compare")
 def compare_accounts(request: Request):
     """横向对比全部账户: 概览 + 回合统计 + 定版净值 (供对比表与净值叠加图)。
 
     净值给全量定版序列, 前端做归一化 (起点=1) 后多账户叠加。
+    对比增量字段 (holdings_count/created_at/last_nav_date/day_change_pct/auto_rules)
+    为加法扩展, 旧前端忽略不影响。
     """
+    from app.strategy import paper_auto
+
     data_dir = _data_dir(request)
+
+    # 盘中实时估算: 当日 enriched 快照就绪时取一次 raw_close 映射, 之后每账户
+    # 纯内存 overview (与 /overview 实时口径一致); 失败降级定版口径
+    live_snapshot: dict[str, float] | None = None
+    qs = getattr(request.app.state, "quote_service", None)
+    if qs is not None:
+        try:
+            enriched, enriched_date = qs.get_enriched_today()
+            from app.market_time import cn_today
+            if not enriched.is_empty() and enriched_date == cn_today():
+                live_snapshot = dict(
+                    zip(enriched["symbol"].to_list(), enriched["raw_close"].to_list(), strict=False)
+                )
+        except Exception as e:  # noqa: BLE001 — 快照来源不定 (行情服务/数据缺失), 软失败降级定版口径
+            logger.warning("paper compare 实时快照不可用, 用定版口径: %s", e)
+
     rows = []
     for acc_id in paper.list_account_ids(data_dir):
         acc = paper.get_account(data_dir, acc_id)
@@ -227,7 +263,23 @@ def compare_accounts(request: Request):
             continue  # 空壳目录 (懒创建) 不进对比
         st = paper.stats(data_dir, acc_id)
         initial = float(acc.get("initial_cash") or 0)
+        nav_rows = paper.load_nav(data_dir, acc_id)
+        day_change_pct = None
+        if len(nav_rows) >= 2 and float(nav_rows[-2]["nav"] or 0) > 0:
+            day_change_pct = round((float(nav_rows[-1]["nav"]) / float(nav_rows[-2]["nav"]) - 1) * 100, 2)
+        rules = paper_auto.load_auto_rules(data_dir, acc_id)
+        # 盘中估算字段 (加法扩展): live_* 为快照价口径, 旧前端忽略不影响
+        live_total = live_pnl_pct = None
+        if live_snapshot is not None and acc.get("status") == "active":
+            live_ov = paper.overview(data_dir, live_snapshot, account_id=acc_id)
+            if live_ov.get("initialized"):
+                live_total = live_ov.get("total")
+                if initial > 0:
+                    live_pnl_pct = round((live_ov.get("total_pnl") or 0) / initial * 100, 2)
         rows.append({
+            "live_total": live_total,
+            "live_pnl_pct": live_pnl_pct,
+            "estimating": live_total is not None,
             "account": acc_id,
             "name": acc.get("name") or acc_id,
             "status": acc.get("status"),
@@ -244,7 +296,23 @@ def compare_accounts(request: Request):
             "avg_holding_days": st.get("avg_holding_days"),
             "realized_pnl": st.get("realized_pnl"),
             "max_drawdown": st.get("max_drawdown"),
-            "nav": [{"date": n["date"], "nav": n["nav"]} for n in paper.load_nav(data_dir, acc_id)],
+            "nav": [{"date": n["date"], "nav": n["nav"]} for n in nav_rows],
+            # 对比展示用增量字段
+            "holdings_count": len(ov.get("holdings") or []),
+            "created_at": acc.get("created_at"),
+            "last_nav_date": nav_rows[-1]["date"] if nav_rows else None,
+            "day_change_pct": day_change_pct,
+            "auto_rules": [
+                {
+                    "name": r.get("name"),
+                    "match_kind": r.get("match_kind"),
+                    "match_id": r.get("match_id"),
+                    "side": r.get("side"),
+                    "enabled": bool(r.get("enabled")),
+                }
+                for r in rules
+            ],
+            "auto_enabled": sum(1 for r in rules if r.get("enabled")),
         })
     return {"accounts": rows}
 
@@ -289,6 +357,7 @@ class AutoRuleModel(BaseModel):
     size_value: float
     order_type: str = "next_open"
     cooldown_days: int = 5
+    max_positions: int = 0             # 最大同时持仓标的数, 0 不限 (对齐回测口径)
     enabled: bool = True
 
 
@@ -323,3 +392,82 @@ def delete_auto_rule(request: Request, rule_id: str, account: str = Query(paper.
     if not paper_auto.delete_auto_rule(_data_dir(request), rule_id, _acc(request, account)):
         raise HTTPException(status_code=404, detail=f"规则不存在: {rule_id}")
     return {"ok": True}
+
+
+# ===== 对比批量创建 (V3): 同规格多账户并行对比的构造入口 =====
+class ArenaSourceModel(BaseModel):
+    name: str | None = None              # 账户名 (缺省用 match_id)
+    match_kind: str                      # strategy / rule (与 auto_rules 同口径)
+    match_id: str
+    side: str = "buy"
+    size_mode: str = "pct_equity"        # 对比默认按权益百分比, 不同本金也可公平比
+    size_value: float = 10.0
+    order_type: str = "next_open"
+    cooldown_days: int = 5
+    max_positions: int = 0             # 最大同时持仓标的数, 0 不限 (对齐回测口径)
+
+
+class ArenaBatchModel(BaseModel):
+    initial_cash: float
+    sources: list[ArenaSourceModel]
+    name_prefix: str = ""                # 账户名前缀 (如 "第一期-", 可空)
+    commission_pct: float = paper.DEFAULT_COMMISSION_PCT
+    stamp_tax_pct: float = paper.DEFAULT_STAMP_TAX_PCT
+    slippage_bps: float = paper.DEFAULT_SLIPPAGE_BPS
+    queue_limit_orders: bool = False
+
+
+@router.post("/arena/batch_create")
+def arena_batch_create(request: Request, body: ArenaBatchModel):
+    """对比批量创建: 同本金/同费率一次性开 N 个账户, 各绑一条自动跟单规则。
+
+    公平对比由构造保证 (同初始资金 + 同费用口径 + 同成交约束, 复用 paper 域
+    的锁与校验)。先整体校验全部规则再落盘 — 任一来源非法即 400, 不留半创建
+    状态; 账户 id 服务端生成 (arena_ + 随机后缀), 不接受调用方指定。
+    """
+    from app.strategy import paper_auto
+
+    if not body.sources:
+        raise HTTPException(status_code=400, detail="至少需要一个来源")
+    if len(body.sources) > 20:
+        raise HTTPException(status_code=400, detail="单次最多创建 20 个对比账户")
+
+    data_dir = _data_dir(request)
+    try:
+        prepared = []
+        for src in body.sources:
+            rule = {
+                "name": f"对比·{(src.name or '').strip() or src.match_id}",
+                "match_kind": src.match_kind,
+                "match_id": (src.match_id or "").strip(),
+                "side": src.side,
+                "size_mode": src.size_mode,
+                "size_value": src.size_value,
+                "order_type": src.order_type,
+                "cooldown_days": src.cooldown_days,
+                "max_positions": src.max_positions,
+                "enabled": True,
+            }
+            paper_auto.validate_rule(rule)  # 全部通过前不落盘 (fail-closed)
+            suffix = (src.name or "").strip() or src.match_id
+            prefix = (body.name_prefix or "").strip()
+            acc_name = f"{prefix}{suffix}" if prefix else suffix
+            prepared.append((rule, acc_name))
+
+        created = []
+        for rule, acc_name in prepared:
+            account_id = f"arena_{uuid.uuid4().hex[:10]}"
+            paper.create_account(
+                data_dir, body.initial_cash,
+                account_id=paper.validate_account_id(account_id),
+                name=acc_name,
+                commission_pct=body.commission_pct,
+                stamp_tax_pct=body.stamp_tax_pct,
+                slippage_bps=body.slippage_bps,
+                queue_limit_orders=body.queue_limit_orders,
+            )
+            saved = paper_auto.create_auto_rule(data_dir, rule, account_id=account_id)
+            created.append({"account": account_id, "name": acc_name, "rule_id": saved["id"]})
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"created": created}

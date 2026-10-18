@@ -30,6 +30,7 @@ from app.enriched_generation import (
     EnrichedGenerationUnavailableError,
     EnrichedPublication,
     bump_enriched_generation,
+    enriched_publication_incomplete,
     get_enriched_generation,
 )
 from app.market_time import cn_today
@@ -38,6 +39,12 @@ from app.polars_guard import guarded_collect
 from app.services.minute_adjust import apply_minute_adjustment, minute_basis_is_raw
 
 logger = logging.getLogger(__name__)
+
+# GH #480: 后台 warmup 因世代漂移被丢弃时的有界重建上限。compute 窗口长达
+# 数十秒, 启动期与 quote 实时刷新的 commit 撞车后若不重建, 历史缓存长期
+# 为空, K 线接口逐请求现算指标。仅 warmup 线程用, 同步/懒加载路径单次。
+_ENRICHED_WARMUP_MAX_ATTEMPTS = 3
+_ENRICHED_WARMUP_PUBLISH_WAIT_SECONDS = 5.0
 
 
 def replace_with_retry(src: Path, dst: Path, *, attempts: int = 10, delay_s: float = 0.5) -> None:
@@ -146,11 +153,15 @@ class DataStore:
         self._register_views()
 
     def _migrate_legacy_data_dir(self) -> None:
-        """把旧桌面版数据目录 (<安装目录>/../TickFlowStockPanel_Data/) 迁移到新位置 (<安装目录>/data/)。
+        """把旧版数据目录迁移到当前位置 (打包桌面版, 首次启动自动搬迁)。
 
-        背景: 旧版 data_dir = exe_dir.parent / "TickFlowStockPanel_Data" (兄弟目录),
-        新版改为 exe_dir / "data" (子目录)。老用户首次升级时旧数据在兄弟目录,
-        若不迁移会导致历史行情/策略/回测/监控全部"丢失"(实际还在旧位置)。
+        legacy 候选 (逐个尝试, 命中即搬):
+          1. data_dir.parent / "TickFlowStockPanel_Data" —— Windows 旧版兄弟目录
+             (旧版 data_dir = exe_dir.parent / "TickFlowStockPanel_Data", 新版改子目录)。
+          2. macOS ≤0.3.6 的 .app 包内数据 (exe 同级 data/) —— 数据在包内时
+             覆盖安装替换 App 会连数据一起进废纸篓; 修复后 data 移到
+             ~/Library/Application Support/TSP, 用户把包内数据找回/恢复进新包
+             (或从 dmg 直接运行过) 的场景由此接住并搬出。
 
         策略 (仅打包桌面版触发, 开发/Docker 不受影响):
           1. 旧目录存在且新 data/ 还基本为空 → 整目录搬迁 (shutil.move, 跨盘符安全)。
@@ -165,41 +176,49 @@ class DataStore:
         import shutil
 
         try:
-            legacy_dir = self.data_dir.parent / "TickFlowStockPanel_Data"
-            if not legacy_dir.exists():
-                return  # 新装用户, 无旧数据
+            candidates: list[Path] = [
+                self.data_dir.parent / "TickFlowStockPanel_Data",
+            ]
+            if sys.platform == "darwin":
+                candidates.append(Path(sys.executable).resolve().parent / "data")
 
-            # 新 data/ 目录里已有实质性内容 → 用户已在新路径跑过, 不覆盖
-            # (用 .parquet 作为"有真实数据"的判据, 避免空子目录误判)
-            has_new_data = any(self.data_dir.rglob("*.parquet")) or any(
-                self.data_dir.rglob("*.jsonl")
-            )
-            if has_new_data:
-                logger.info(
-                    "legacy data dir %s exists but new %s already has data, skip migration",
-                    legacy_dir, self.data_dir,
+            for legacy_dir in candidates:
+                if not legacy_dir.exists():
+                    continue
+                if legacy_dir.resolve() == self.data_dir.resolve():
+                    continue  # 防御: 同一路径 (理论上不会出现) 不做任何事
+
+                # 新 data/ 目录里已有实质性内容 → 用户已在新路径跑过, 不覆盖
+                # (用 .parquet 作为"有真实数据"的判据, 避免空子目录误判)
+                has_new_data = any(self.data_dir.rglob("*.parquet")) or any(
+                    self.data_dir.rglob("*.jsonl")
                 )
-                return
+                if has_new_data:
+                    logger.info(
+                        "legacy data dir %s exists but new %s already has data, skip migration",
+                        legacy_dir, self.data_dir,
+                    )
+                    continue
 
-            logger.info("migrating legacy data %s -> %s", legacy_dir, self.data_dir)
-            # 逐项 move 而非整目录 move: data/ 可能已被 __init__ 创建了空子目录,
-            # 直接 shutil.move(legacy, data) 会因目标已存在失败。
-            for item in legacy_dir.iterdir():
-                dest = self.data_dir / item.name
-                if dest.exists():
-                    # 同名子目录 (如 kline_daily): 合并内容
-                    if dest.is_dir():
-                        shutil.move(str(item), str(dest / item.name))
+                logger.info("migrating legacy data %s -> %s", legacy_dir, self.data_dir)
+                # 逐项 move 而非整目录 move: data/ 可能已被 __init__ 创建了空子目录,
+                # 直接 shutil.move(legacy, data) 会因目标已存在失败。
+                for item in legacy_dir.iterdir():
+                    dest = self.data_dir / item.name
+                    if dest.exists():
+                        # 同名子目录 (如 kline_daily): 合并内容
+                        if dest.is_dir():
+                            shutil.move(str(item), str(dest / item.name))
+                        else:
+                            item.unlink()  # 同名文件, 以新路径为准, 删旧
                     else:
-                        item.unlink()  # 同名文件, 以新路径为准, 删旧
-                else:
-                    shutil.move(str(item), str(dest))
-            # 搬完后清理空的旧目录
-            try:
-                shutil.rmtree(legacy_dir)
-            except OSError:
-                logger.warning("legacy dir %s not empty, kept", legacy_dir)
-            logger.info("legacy data migration done")
+                        shutil.move(str(item), str(dest))
+                # 搬完后清理空的旧目录
+                try:
+                    shutil.rmtree(legacy_dir)
+                except OSError:
+                    logger.warning("legacy dir %s not empty, kept", legacy_dir)
+                logger.info("legacy data migration done")
         except Exception as e:  # noqa: BLE001
             logger.warning("legacy data migration failed (startup continues): %s", e)
 
@@ -478,6 +497,8 @@ class KlineRepository:
 
         仿 QuoteService 的线程模式: 设 warming 标志 → 起 daemon → 完成后清标志 +
         触发回调。重复调用时若已有线程在跑则跳过 (避免重复预热)。
+        预热走 _warmup_enriched: 世代漂移导致丢弃时有界重建 (GH #480),
+        同步/懒加载路径仍走单次 _refresh_enriched, 不阻塞 HTTP。
         """
         with self._warmup_lock:
             if self._enriched_warming:
@@ -489,7 +510,7 @@ class KlineRepository:
             t0 = time.perf_counter()
             try:
                 logger.info("enriched warmup thread started")
-                self._refresh_enriched()
+                self._warmup_enriched()
                 logger.info("enriched warmup thread done (%.1fs)", time.perf_counter() - t0)
                 self._notify_refresh_done()
             except Exception:  # noqa: BLE001
@@ -555,11 +576,42 @@ class KlineRepository:
         self._index_enriched_cache = None
         self._index_enriched_cache_date = None
 
-    def _refresh_enriched(self) -> None:
+    def _refresh_enriched(self) -> bool:
+        """刷新 enriched 内存缓存。返回 True 表示因数据换代被丢弃、可重试。
+
+        返回 False 覆盖两种情形: 成功建成, 或非换代失败 (不重试, 保持降级)。
+        现有调用方均不读返回值, 行为不变; 仅后台 warmup 线程用返回值做有界重建。
+        """
         from app.services.heavy_job_limiter import shared_heavy_job_limiter
 
         with shared_heavy_job_limiter.slot("exclusive"):
-            self._refresh_enriched_impl()
+            try:
+                self._refresh_enriched_impl()
+            except EnrichedGenerationUnavailableError as e:
+                logger.warning("enriched 历史缓存因数据换代被丢弃 (可重试): %s", e)
+                return True
+            except Exception as e:  # noqa: BLE001
+                logger.warning("enriched 缓存刷新失败: %s", e)
+                return False
+        return False
+
+    def _warmup_enriched(self) -> None:
+        """仅后台预热线程调用: 世代漂移导致丢弃时以新世代有界重建。
+
+        warmup 的 compute 窗口长达数十秒, 启动期与 quote 实时刷新的 commit
+        撞车概率高; 丢弃后不重建会把缓存长期留冷, K 线接口逐请求现算指标
+        (GH #480)。每轮重新捕获世代、各自仍 fail-closed; 发布未完成时短暂
+        等待再试; 超过上限则放弃并保持冷缓存降级 (非无限重读)。
+        """
+        for attempt in range(_ENRICHED_WARMUP_MAX_ATTEMPTS):
+            if attempt and enriched_publication_incomplete(self.store.data_dir, "stock"):
+                time.sleep(_ENRICHED_WARMUP_PUBLISH_WAIT_SECONDS)
+            if not self._refresh_enriched():
+                return
+        logger.warning(
+            "enriched 历史缓存预热因持续换代被丢弃, %d 轮后放弃 (保持冷缓存降级)",
+            _ENRICHED_WARMUP_MAX_ATTEMPTS,
+        )
 
     def _refresh_enriched_impl(self) -> None:
         """从 parquet 加载 enriched 最新日到内存 + 构建聚合表。
@@ -606,6 +658,7 @@ class KlineRepository:
             # 300 日历天 ≈ 210 交易日, 覆盖 filter_history 最大 lookback(90) + warmup(60)
             try:
                 from datetime import timedelta
+
                 from app.indicators.pipeline import compute_enriched_history_window
                 start_full = latest - timedelta(days=300)
                 read_cols = [c for c in ["symbol", "date", "open", "high", "low", "close",
@@ -693,8 +746,9 @@ class KlineRepository:
 
             logger.info("enriched 缓存已加载: %d 只, 日期 %s", len(df_latest), latest)
             logger.info("enriched refresh done fallback (%.2fs)", time.perf_counter() - started)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("enriched 缓存刷新失败: %s", e)
+        except EnrichedGenerationUnavailableError:
+            # 换代丢弃上抛给 _refresh_enriched: 后台 warmup 可重试, 同步路径记 warning 降级
+            raise
 
     def _restore_missing_latest_rows(
         self,
@@ -763,6 +817,7 @@ class KlineRepository:
         优化: 优先使用 _enriched_history_cache (启动时已计算), 避免重复 compute_indicators。
         """
         from datetime import timedelta
+
         from app.indicators.pipeline import _ema_alpha
 
         started = time.perf_counter()
@@ -1051,6 +1106,7 @@ class KlineRepository:
                 return
 
             from datetime import timedelta
+
             from app.indicators.pipeline import compute_indicators, compute_signals
             start_full = latest - timedelta(days=300)
             read_cols = [c for c in ["symbol", "date", "open", "high", "low", "close",
@@ -1223,7 +1279,7 @@ class KlineRepository:
         # 按交易日计数裁剪: 从数据里实际存在的交易日序列取最后 lookback_days 个交易日。
         # 不能用 timedelta(days=N) (自然日), 否则周末/节假日会让窗口只有 ~N×5/7 个交易日,
         # 导致 filter_history 策略的滚动窗口/行号差(_gap)漏算, 与回测结果不一致。
-        # 只数目标日及之前的交易日: 历史日期选股时缓存里还有更晚的交易日
+        # 只数目标日及之前的交易日: 历史日期运行策略时缓存里还有更晚的交易日
         trading_dates = cache["date"].filter(cache["date"] <= target_date).unique().sort()
         if len(trading_dates) > lookback_days:
             lookback_start = trading_dates[-(lookback_days + 1)]
@@ -1528,6 +1584,35 @@ class KlineRepository:
             if start >= cache_date:
                 return self._filter_cached_batch(cached, symbols, columns)
 
+        # 复用 300 天预计算 enriched 历史缓存 (与单股 get_daily 同源同判据):
+        # 自选迷你蜡烛窗口 (days≤60) 完全落在缓存内, 免整树 glob 扫描;
+        # 覆盖不足 (窗口早于缓存起点 / symbol 不在缓存) 时回退扫描路径。
+        df = pl.DataFrame()
+        hist = self._enriched_history_cache
+        if hist is not None and not hist.is_empty() and "date" in hist.columns:
+            hist_min = self._enriched_history_start
+            hist_max = hist["date"].max()
+            if hist_min is not None and hist_min <= start and hist_max >= start:
+                df = hist.filter(
+                    pl.col("symbol").is_in(symbols)
+                    & (pl.col("date") >= start)
+                    & (pl.col("date") <= end)
+                )
+
+        if not df.is_empty():
+            # 用实时缓存覆盖最新日 (与单股 get_daily 的覆盖逻辑同口径)
+            if cached is not None and not cached.is_empty() and cache_date and start <= cache_date <= end:
+                cached_part = self._filter_cached_batch(cached, symbols, None)
+                if not cached_part.is_empty():
+                    df = df.filter(pl.col("date") != cache_date)
+                    common_cols = [c for c in df.columns if c in cached_part.columns]
+                    df = pl.concat([df.select(common_cols), cached_part.select(common_cols)])
+            if columns and not df.is_empty():
+                existing = [c for c in columns if c in df.columns]
+                df = df.select(existing)
+            if not df.is_empty():
+                return df.sort(["symbol", "date"])
+
         # 回退 scan_parquet
         return self._scan_daily_batch(symbols, start, end, columns)
 
@@ -1623,16 +1708,28 @@ class KlineRepository:
             logger.warning("分钟复权投影失败, 按原始数据返回: %s", e)
             return df
 
+    def _minute_partition_path(self, asset_type: str, trade_date: date) -> str | None:
+        """单日分钟K分区文件路径; 不存在 (含存量未迁移的旧 symbol= 分区) 返回 None。"""
+        base = self._minute_glob_for(asset_type).rsplit("/", 2)[0]
+        p = f"{base}/date={trade_date.isoformat()}/part.parquet"
+        return p if Path(p).exists() else None
+
     def get_minute(
         self,
         symbol: str,
         trade_date: date,
         asset_type: str = "stock",
     ) -> pl.DataFrame:
-        """分钟K查询 — Polars scan_parquet + predicate pushdown。"""
+        """分钟K查询 — 优先直读当日分区文件 (免全树 footer IO), 分区缺失回退全树扫描。
+
+        该查询在自选分时热路径上被每 tick、每客户端调用, 全树 glob 扫描成本随
+        本地分钟历史线性增长; 单日数据按约定完整落在 date= 分区内, 谓词不变。
+        """
         try:
+            part = self._minute_partition_path(asset_type, trade_date)
+            source = part if part is not None else self._minute_glob_for(asset_type)
             df = guarded_collect(
-                pl.scan_parquet(self._minute_glob_for(asset_type)).filter(
+                pl.scan_parquet(source).filter(
                     (pl.col("symbol") == symbol)
                     & (pl.col("datetime").dt.date() == trade_date)
                 ).sort("datetime")
@@ -1648,16 +1745,18 @@ class KlineRepository:
         trade_date: date,
         asset_type: str = "stock",
     ) -> pl.DataFrame:
-        """批量分钟K查询 — 多 symbol 一次 scan_parquet。
+        """批量分钟K查询 — 多 symbol 一次 scan, 优先直读当日分区文件。
 
         用于自选列表分时图: 一次 predicate pushdown 读多只股票当日分钟K,
-        避免逐只查询的 N 次 I/O。
+        避免逐只查询的 N 次 I/O; 单日直读避免全树扫描 (同 get_minute)。
         """
         if not symbols:
             return pl.DataFrame()
         try:
+            part = self._minute_partition_path(asset_type, trade_date)
+            source = part if part is not None else self._minute_glob_for(asset_type)
             df = guarded_collect(
-                pl.scan_parquet(self._minute_glob_for(asset_type)).filter(
+                pl.scan_parquet(source).filter(
                     pl.col("symbol").is_in(symbols)
                     & (pl.col("datetime").dt.date() == trade_date)
                 ).sort(["symbol", "datetime"])
@@ -1748,7 +1847,12 @@ class KlineRepository:
 
     def _compute_enriched_range(self, df: pl.DataFrame) -> pl.DataFrame:
         """对14列enriched数据即时计算完整指标+信号。输入应含足够预热行数。"""
-        from app.indicators.pipeline import compute_indicators, compute_signals, compute_limit_signals, filter_halt_days
+        from app.indicators.pipeline import (
+            compute_indicators,
+            compute_limit_signals,
+            compute_signals,
+            filter_halt_days,
+        )
         if df.is_empty() or df.height < 2:
             return df
         # 兜底过滤历史脏数据中的停牌日 (close 可能被填充为前收盘价)
@@ -1958,7 +2062,7 @@ class KlineRepository:
         """枚举 [start, end] 内存在的分钟K分区日 (目录名直读, 零 parquet 扫描)。
 
         分钟回测按交易日精确对日: 缺分区的日子由调用方显式跳过,
-        不做"回退最近分区" (那是实盘选股的语义, 回放会串日)。
+        不做"回退最近分区" (那是实盘策略的语义, 回放会串日)。
         """
         dirname = "kline_minute" if asset_type == "stock" else f"kline_{asset_type}_minute"
         minute_dir = self.store.data_dir / dirname

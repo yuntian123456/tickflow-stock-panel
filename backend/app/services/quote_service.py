@@ -1,6 +1,6 @@
 """全局实时行情服务。
 
-集中管理全市场行情拉取 + enriched 缓存，供盘中选股、自选股等所有模块复用。
+集中管理全市场行情拉取 + enriched 缓存，供盘中策略、自选等所有模块复用。
 
 架构:
   - 后台线程轮询 TickFlow get_by_universes(["CN_Equity_A", "CN_ETF"]) + 核心指数按码拉取
@@ -29,7 +29,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import date, datetime, time as dt_time
+from datetime import date, datetime
+from datetime import time as dt_time
 
 import polars as pl
 
@@ -76,6 +77,14 @@ logger = logging.getLogger(__name__)
 # webhook 慢/宕机会逐条累加, 拖垮整条实时行情+告警轮询。这里 fire-and-forget,
 # 失败由 webhook_adapter 记 WARNING(可见), 但绝不阻塞热路径。
 _WEBHOOK_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="feishu-webhook")
+
+
+def shutdown_webhook_executor() -> None:
+    """应用关闭时放弃仍在排队的投递并关闭线程池 (lifespan shutdown 调用)。
+
+    不调用则 daemon 工作线程随进程退出, 排队中的 webhook 静默丢失。
+    """
+    _WEBHOOK_EXECUTOR.shutdown(wait=False, cancel_futures=True)
 
 
 class QuoteSubscriber:
@@ -215,6 +224,10 @@ class QuoteService:
         # 串行化行情拉取: 手动 POST /refresh 与后台轮询线程可能并发调用
         # _fetch_quotes, 两者同时写同一批 parquet/缓存会互相覆盖
         self._fetch_lock = threading.Lock()
+        # 监控评估专用锁: 评估已移出 _fetch_lock (评估链含告警落盘/模拟盘逐账户
+        # IO/webhook 判定, 留在取数锁内会阻塞下一轮拉取与手动刷新), 此锁保证
+        # 两轮评估不并发 (原先由取数锁隐式串行)。
+        self._evaluate_lock = threading.Lock()
         self._running = False
         self._enabled = False      # 全局开关 (持久化到 preferences)
         # 暂停态: 盘后管道/数据修正运行期间临时暂停取数, 防止与管道写同一批 parquet 竞态。
@@ -300,7 +313,7 @@ class QuoteService:
         """开启自动行情 (不立即启动线程，等下一个交易时段)。
 
         none 档无实时行情权限,拒绝开启并返回 False;
-        free 档开启自选股实时,starter+ 开启全市场实时。返回值表示是否真正开启。
+        free 档开启自选实时,starter+ 开启全市场实时。返回值表示是否真正开启。
         """
         if not self.is_realtime_allowed():
             logger.warning("实时行情开启被拒:当前档位(none)无实时行情权限")
@@ -370,7 +383,10 @@ class QuoteService:
         if not self.is_realtime_allowed():
             if preferences.get_realtime_quotes_enabled():
                 self._save_enabled(False)
-            logger.info("实时行情未启动:当前档位(none)无实时行情权限")
+            # 带生效源: 便于判断「该切哪个源」, 而不是只看到 TickFlow 档位
+            from app.data_providers.capabilities import capability_gate
+            _, label = capability_gate("realtime")
+            logger.info("实时行情未启动: %s 不可用", label)
             return
         if preferences.get_realtime_quotes_enabled():
             self.start()
@@ -518,7 +534,7 @@ class QuoteService:
         return self._repo.get_enriched_latest()
 
     def get_quotes_compat(self) -> pl.DataFrame:
-        """兼容接口: 返回行情 DataFrame (用于盘中选股等需要 last_price/prev_close 的场景)。
+        """兼容接口: 返回行情 DataFrame (用于盘中策略等需要 last_price/prev_close 的场景)。
 
         从 _enriched_cache 取 today 的数据, 只选行情基础列, 补上 last_price 别名。
         不返回指标列, 避免 JOIN live_agg 时列名冲突。
@@ -527,7 +543,7 @@ class QuoteService:
         if df.is_empty():
             return df
 
-        # 只取盘中选股需要的行情基础列
+        # 只取盘中策略需要的行情基础列
         keep = [c for c in [
             "symbol", "close", "open", "high", "low", "volume", "amount",
             "prev_close", "change_pct", "change_amount", "amplitude", "turnover_rate",
@@ -644,21 +660,46 @@ class QuoteService:
                 time.sleep(0.5)
                 waited += 0.5
 
+    def _cleanup_day_scoped_state(self) -> None:
+        """按日清理 final 同步状态 (键为 (date, phase), 严格无界累积)。
+
+        旧日期键不再被 _final_sync_key 命中, 新交易日首次拉取时清掉;
+        放在 _fetch_quotes 入口而非 _update_volume_delta, 避免依赖最小实例
+        (测试用 __new__ 构造) 不具备的属性。
+        """
+        today = cn_today()
+        if self._final_sync_done and any(k[0] != today for k in self._final_sync_done):
+            self._final_sync_done = {k for k in self._final_sync_done if k[0] == today}
+        if self._final_sync_failed and any(k[0] != today for k in self._final_sync_failed):
+            self._final_sync_failed = {k: v for k, v in self._final_sync_failed.items() if k[0] == today}
+
     def _fetch_quotes(self, *, final: bool = False, final_boundary_ms: int | None = None) -> bool:
         """拉取行情。加锁串行化 (后台轮询 vs 手动 refresh)。返回本轮是否成功更新。
 
         final_boundary_ms: final 定版的边界时间戳 (ms)。传入时快照时间戳未达边界
         的本轮不落盘 (见 _process_full_market_records)。
         """
+        self._cleanup_day_scoped_state()
         with self._fetch_lock:
             before = self._fetched_at
             if final:
                 logger.info("最终行情同步开始")
-            self._fetch_full_market_quotes(final_boundary_ms=final_boundary_ms)
-            return self._fetched_at > before
+            snapshot = self._fetch_full_market_quotes(final_boundary_ms=final_boundary_ms)
+            updated = self._fetched_at > before
+        # 监控评估移出取数锁执行: 评估输入是本轮快照 (daily_df/quote_extra),
+        # 离锁执行结果不变; 时序不变式 (enriched 替换后才评估) 仍由调用顺序保证。
+        if snapshot is not None:
+            with self._evaluate_lock:
+                self._evaluate_monitors(*snapshot)
+        return updated
 
-    def _fetch_full_market_quotes(self, final_boundary_ms: int | None = None) -> None:
-        """拉取全市场行情 → 写 daily + 计算 enriched + 更新缓存。"""
+    def _fetch_full_market_quotes(
+        self, final_boundary_ms: int | None = None
+    ) -> tuple[pl.DataFrame, pl.DataFrame | None] | None:
+        """拉取全市场行情 → 写 daily + 计算 enriched + 更新缓存。
+
+        返回 (daily_df, quote_extra) 快照供调用方在锁外评估监控; 空/失败轮返回 None。
+        """
         from app.services import preferences
 
         provider_name = preferences.get_realtime_data_provider()
@@ -697,14 +738,13 @@ class QuoteService:
                 except Exception as e:  # noqa: BLE001
                     logger.warning("自定义实时行情拉取失败: %s", e)
                     return
-                self._process_full_market_records(
+                return self._process_full_market_records(
                     records,
                     t0=t0,
                     now_ts=now_ts,
                     replace_index_cache=replace_index_cache,
                     final_boundary_ms=final_boundary_ms,
                 )
-                return
             # 自定义源未配置 realtime → 回退 TickFlow
 
         from app.tickflow.client import get_paid_realtime_client
@@ -791,7 +831,7 @@ class QuoteService:
                 "session": q.get("session"),
             })
 
-        self._process_full_market_records(
+        return self._process_full_market_records(
             records, t0=t0, now_ts=now_ts, final_boundary_ms=final_boundary_ms
         )
 
@@ -803,7 +843,7 @@ class QuoteService:
         now_ts: float,
         replace_index_cache: bool = True,
         final_boundary_ms: int | None = None,
-    ) -> None:
+    ) -> tuple[pl.DataFrame, pl.DataFrame | None] | None:
         """把全市场 records 写盘并增量计算 enriched。
 
         final_boundary_ms (final 定版边界) 传入时, 快照最大时间戳未达边界的本轮
@@ -914,7 +954,9 @@ class QuoteService:
         self._broadcast_quote_updated()
 
         # ---- 策略监控 + 告警评估 ----
-        self._evaluate_monitors(daily_df, quote_extra)
+        # 由调用方 (_fetch_quotes) 持 _evaluate_lock 在取数锁外执行;
+        # 返回本轮快照 (daily_df, quote_extra) 作为评估输入
+        return daily_df, quote_extra
 
     # ================================================================
     # 工具
@@ -1234,7 +1276,7 @@ class QuoteService:
                     # 独立 try —— ETF 轮任何异常都不得丢弃本轮已算出的股票告警。
                     # refresh=False —— 不在轮询线程上触发 ETF 冷缓存的同步重算 (缓存由 ETF 实时
                     # flush 焐热; 未焐热说明无 ETF 实时数据, 跳过本轮 ETF 评估)。
-                    # 日期守卫同指数轮: 自选/选股等页面会把磁盘上一交易日的 ETF 快照读进缓存,
+                    # 日期守卫同指数轮: 自选/策略等页面会把磁盘上一交易日的 ETF 快照读进缓存,
                     # ETF 实时拉取关闭 (默认) 或休市时它不会被当日数据替换, 不得当作当日评估。
                     if engine.has_asset_rules("etf") and self._repo is not None:
                         try:
@@ -1745,8 +1787,7 @@ class QuoteService:
         - 批量策略事件 (symbol="") 聚合为一条通知, 避免刷屏
         """
         try:
-            from app.services import preferences
-            from app.services import notify_adapter
+            from app.services import notify_adapter, preferences
 
             if not preferences.get_system_notify_enabled():
                 return
@@ -1809,7 +1850,7 @@ class QuoteService:
 
             if use_incremental:
                 from app.indicators.pipeline import compute_enriched_today
-                from app.market_time import trading_minutes_elapsed_from_ts, trading_minutes_elapsed
+                from app.market_time import trading_minutes_elapsed, trading_minutes_elapsed_from_ts
                 instruments = self._repo.get_instruments()
                 # 将 API 直接提供的补充字段 JOIN 到 daily_df
                 today_ohlcv = daily_df
@@ -1837,6 +1878,7 @@ class QuoteService:
             # ---- 全量回退路径 ----
             if not use_incremental:
                 from datetime import timedelta
+
                 from app.indicators.pipeline import compute_enriched
                 from app.tickflow.repository import _live_agg_window_start
 

@@ -40,6 +40,7 @@ from pathlib import Path
 import polars as pl
 
 from app.market_time import CN_TZ, cn_now, cn_today
+from app.parquet import scan_daily_parquet
 from app.services.fs_utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
@@ -259,6 +260,34 @@ def update_settings(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID, **fiel
         return acc
 
 
+def delete_account(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID, *, force: bool = False) -> tuple[dict | None, str | None]:
+    """删除账户及其全部数据 (台账/持仓/净值/规则, 不可恢复)。
+
+    fail-closed: 账户仍有持仓标的或待成交订单时拒绝删除, 调用方显式 force=True
+    才强删。目录删除限定在 accounts/{account_id} (id 校验只允许字母数字下划线
+    短横线, 无路径穿越面)。返回 (统计, None) 或 (None, 拒绝原因)。
+    """
+    with PAPER_LOCK:
+        acc = get_account(data_dir, account_id)
+        if acc is None:
+            return None, "账户不存在"
+        positions = load_positions(data_dir, account_id)
+        holdings = sum(1 for p in positions.values() if p["qty"] > 0)
+        pending = sum(1 for o in load_orders(data_dir, account_id) if o["status"] == "pending")
+        if (holdings or pending) and not force:
+            detail = " 与 ".join(
+                s for s in (
+                    f"{holdings} 个持仓标的" if holdings else "",
+                    f"{pending} 张待成交订单" if pending else "",
+                ) if s
+            )
+            return None, f"账户仍有 {detail}, 确认删除需 force=true"
+        root = accounts_base(data_dir) / validate_account_id(account_id)
+        if root.exists():
+            shutil.rmtree(root)
+        return {"holdings": holdings, "pending_orders": pending}, None
+
+
 # ── 费用 (纯函数) ───────────────────────────────────────
 def apply_slippage(price: float, side: str, slippage_bps: float) -> float:
     """买入向上滑、卖出向下滑 (对成交价不利方向)。"""
@@ -278,12 +307,12 @@ def sell_fee(qty: int, price: float, commission_pct: float, stamp_tax_pct: float
 def limit_pct(symbol: str, asset_type: str) -> float:
     """涨跌停幅度。V1 简化: ST 未识别 (无名称数据), 基金统一 10%。
 
-    股票: 创业板 300/301 与科创板 688 → 20%; 北交所 43/83/87/92 开头 → 30%; 其余 10%。
+    股票: 创业板 300/301/302 与科创板 688/689 → 20%; 北交所 43/83/87/92 开头 → 30%; 其余 10%。
     """
     if asset_type == "etf":
         return 0.10
     code = symbol.split(".")[0]
-    if code.startswith(("300", "301", "688")):
+    if code.startswith(("300", "301", "302", "688", "689")):
         return 0.20
     if code.startswith(("43", "83", "87", "92")):
         return 0.30
@@ -394,20 +423,12 @@ def create_order(
             if est_price > 0 and qty * est_price * (1 + acc["slippage_bps"] / 10000) + buy_fee(qty, est_price, acc["commission_pct"]) > acc_cash:
                 return None, f"可用资金不足 (需约 {qty * est_price:.0f}, 可用 {acc_cash:.0f})"
         else:
-            pos = load_positions(data_dir, account_id).get(symbol)
-            if pos is None or pos["qty"] <= 0:
+            held = sell_capacity(data_dir, symbol, account_id)
+            if held is None:
                 return None, f"无 {symbol} 持仓, 不能卖出"
-            # 可卖数量按当前交易日现算 (与 _fill_order / overview 同口径): 物化文件里的
-            # available_qty 是上次重建时的 T+1 口径, 跨日后不会更新, 次日仍会是 0
-            available = _available_of(pos, cn_today().isoformat())
+            available, pending_sell = held
             if qty > available:
                 return None, f"可卖数量不足 (T+1): 可卖 {available}, 请求数量 {qty}"
-            # 超卖防护: pending 卖出单占用可卖额度 — 同 symbol 的 pending 卖出合计
-            # 不得超过可卖数量, 否则多张单各自通过校验、成交时逐张扣减会超额
-            pending_sell = sum(
-                int(o["qty"]) for o in load_orders(data_dir, account_id)
-                if o["status"] == "pending" and o["side"] == "sell" and o["symbol"] == symbol
-            )
             if pending_sell + qty > available:
                 return None, (
                     f"可卖数量不足 (T+1): 可卖 {available}, "
@@ -553,6 +574,26 @@ def replay_positions(
                 pos["avg_cost"] = 0.0
         pos["available_qty"] = _available_of(pos)
     return positions, round(cash, 2)
+
+
+def sell_capacity(
+    data_dir: Path, symbol: str, account_id: str = DEFAULT_ACCOUNT_ID,
+) -> tuple[int, int] | None:
+    """(T+1 可卖数量, 同 symbol 已挂 pending 卖出合计); 无持仓返回 None。
+
+    可卖数量按当前交易日现算 (与 _fill_order / overview 同口径): 物化文件里的
+    available_qty 是上次重建时的 T+1 口径, 跨日后不会更新, 次日仍会是 0。
+    pending 卖出单占用可卖额度, 否则多张单各自通过校验、成交时逐张扣减会超额。
+    """
+    pos = load_positions(data_dir, account_id).get(symbol)
+    if pos is None or pos["qty"] <= 0:
+        return None
+    available = _available_of(pos, cn_today().isoformat())
+    pending_sell = sum(
+        int(o["qty"]) for o in load_orders(data_dir, account_id)
+        if o["status"] == "pending" and o["side"] == "sell" and o["symbol"] == symbol
+    )
+    return available, pending_sell
 
 
 def _available_of(pos: dict, today: str | None = None) -> int:
@@ -808,7 +849,7 @@ def read_daily_bar(data_dir: Path, symbol: str, asset_type: str, day: str) -> di
         return None
     try:
         df = (
-            pl.scan_parquet((base / "**" / "*.parquet").as_posix())
+            scan_daily_parquet((base / "**" / "*.parquet").as_posix())
             .filter((pl.col("symbol") == symbol) & (pl.col("date") == _date.fromisoformat(day)))
             .select(["open", "close"])
             .collect()
@@ -828,7 +869,7 @@ def _prev_close(data_dir: Path, symbol: str, asset_type: str, day: str) -> float
         return None
     try:
         df = (
-            pl.scan_parquet((base / "**" / "*.parquet").as_posix())
+            scan_daily_parquet((base / "**" / "*.parquet").as_posix())
             .filter((pl.col("symbol") == symbol) & (pl.col("date") < _date.fromisoformat(day)))
             .sort("date")
             .select(pl.col("close").last())
@@ -849,7 +890,7 @@ def _index_close(data_dir: Path, day: str) -> float | None:
         return None
     try:
         df = (
-            pl.scan_parquet((base / "**" / "*.parquet").as_posix())
+            scan_daily_parquet((base / "**" / "*.parquet").as_posix())
             .filter((pl.col("symbol") == "000300.SH") & (pl.col("date") == _date.fromisoformat(day)))
             .select("close")
             .collect()

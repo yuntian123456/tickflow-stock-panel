@@ -90,7 +90,8 @@ export function AssistantDrawer() {
         <DrawerPanel key="assistant-drawer" sending={sending} messages={messages} />
       )}
     </AnimatePresence>,
-    document.body,
+    // #root (缩放层): 抽屉随界面缩放, 且与 Modal 同层叠上下文保持 z 序设计。
+    document.getElementById('root') ?? document.body,
   )
 }
 
@@ -206,9 +207,9 @@ function RhPromoBanner() {
     >
       <span className="font-medium text-amber-600 dark:text-amber-400">Claude、ChatGPT、Gemini</span>
       <span>等国际模型直连稳定不掉线，</span>
-      <span className="font-medium text-amber-600 dark:text-amber-400">最高优惠 80%</span>
+      <span className="font-medium text-amber-600 dark:text-amber-400">DeepSeek v4.1 Flash 3 折</span>
       <span>，</span>
-      <span className="font-medium text-amber-600 dark:text-amber-400">通过此链接注册赠送 1000 RH 积分</span>
+      <span className="font-medium text-amber-600 dark:text-amber-400">注册赠送 1000 RH 积分</span>
       <span>🎁</span>
     </a>
   )
