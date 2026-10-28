@@ -105,6 +105,9 @@ RUN if [ "$INCLUDE_ELTDX" = "1" ]; then \
       uv pip install --no-cache -r ./app/plugins/eltdx/requirements.txt; \
     fi
 COPY tiers.yaml /app/tiers.yaml
+# 版本号运行时兜底 (issue #513): 非冻结路径 _load_version() 读
+# /app/frontend/package.json, 缺文件会静默回退 _FALLBACK_VERSION 显示旧版本。
+COPY frontend/package.json /app/frontend/package.json
 ENV STATIC_DIR=/app/static \
     TIERS_YAML=/app/tiers.yaml \
     DATA_DIR=/app/data \
