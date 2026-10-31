@@ -54,6 +54,7 @@ from app.api import settings as settings_api
 from app.api import upgrade_guard as upgrade_guard_api
 from app.api.routes import router as core_router
 from app.config import settings
+from app.data_providers.base import ProviderRequestError
 from app.enriched_generation import EnrichedGenerationUnavailableError
 from app.extensions.loader import (
     configure_backend_extensions,
@@ -61,6 +62,7 @@ from app.extensions.loader import (
     start_backend_extensions,
 )
 from app.jobs import daily_pipeline
+from app.services.daily_health import DailyIntegrityError
 from app.services.matrix_prewarm_owner import MatrixCachePrewarmOwner
 from app.services.mining_process_lock import MiningProcessLock, MiningProcessLockError
 from app.services.quote_service import QuoteService
@@ -502,10 +504,10 @@ async def _application_lifespan(app: FastAPI):
         mrs = getattr(app.state, "minute_refresh", None)
         if mrs:
             mrs.stop()
-        # webhook 投递线程池: 放弃排队投递并关闭, 避免通知静默丢失在 daemon 线程里
-        from app.services.quote_service import shutdown_webhook_executor
+        # webhook/系统通知投递线程池: 放弃排队投递并关闭, 避免通知静默丢失在 daemon 线程里
+        from app.services.quote_service import shutdown_delivery_executors
 
-        shutdown_webhook_executor()
+        shutdown_delivery_executors()
         logger.info("shutdown")
 
 
@@ -725,6 +727,16 @@ async def capability_denied_handler(request: Request, exc: CapabilityDenied) -> 
         status_code=403,
         content={"detail": str(exc), "suggestion": exc.suggestion},
     )
+
+
+@app.exception_handler(DailyIntegrityError)
+async def daily_integrity_error_handler(request: Request, exc: DailyIntegrityError) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc), "code": "daily_integrity"})
+
+
+@app.exception_handler(ProviderRequestError)
+async def provider_request_error_handler(request: Request, exc: ProviderRequestError) -> JSONResponse:
+    return JSONResponse(status_code=502, content={"detail": str(exc), "code": "provider_request"})
 
 # 生产期静态文件(前端 dist)
 def _register_static_routes(target: FastAPI, static_dir: Path) -> None:
