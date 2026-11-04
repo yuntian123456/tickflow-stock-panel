@@ -672,6 +672,7 @@ def get_preferences() -> dict:
         "index_daily_batch_size": preferences.get_index_daily_batch_size(),
         "daily_batch_symbols": preferences.get_daily_batch_symbols(),
         "minute_batch_symbols": preferences.get_minute_batch_symbols(),
+        "backtest_worker_rss_limit_gib": preferences.get_backtest_worker_rss_limit_gib(),
         "watchlist_columns": preferences.get_watchlist_columns(),
         "screener_result_columns": preferences.get_screener_result_columns(),
         "sse_refresh_pages": preferences.get_sse_refresh_pages(),
@@ -967,10 +968,15 @@ def update_data_providers(req: DataProvidersIn, request: Request) -> dict:
     """保存数据源选择。"""
     from app.services import preferences
     updates = req.model_dump(exclude_none=True)
-    if updates:
-        preferences.save(updates)
-    # 刷新能力快照: 当前 provider 变化会改变自定义源能力增广结果 (读缓存, 无网络请求)
-    request.app.state.capabilities = detect_capabilities()
+    with preferences.mutation():
+        from app.data_providers import custom as custom_sources
+        removing = {p["name"] for p in custom_sources.list_plugins() if p.get("pending_remove")}
+        if any(provider.lower() in removing for provider in updates.values()):
+            raise HTTPException(400, "该插件正在等待卸载，请选择其他数据源")
+        if updates:
+            preferences.save(updates)
+        # 与插件卸载共用写锁，避免并发请求重新引用已移除的数据源。
+        request.app.state.capabilities = detect_capabilities()
     return {
         "daily_data_provider": preferences.get_daily_data_provider(),
         "adj_factor_provider": preferences.get_adj_factor_provider(),
@@ -2102,6 +2108,19 @@ def update_minute_batch_symbols(req: BatchSymbolsIn) -> dict:
     """保存 minute-batch 单请求标的数上限 (同时是前端分块大小)。"""
     from app.services import preferences
     return {"minute_batch_symbols": preferences.set_minute_batch_symbols(req.size)}
+
+
+class BacktestWorkerRssLimitIn(BaseModel):
+    gib: int = Field(ge=0, le=64, description="回测/优化 worker RSS 上限 (GiB), 0 = 不限制")
+
+
+@router.put("/preferences/backtest-worker-rss-limit")
+def update_backtest_worker_rss_limit(req: BacktestWorkerRssLimitIn) -> dict:
+    """保存回测/优化 worker RSS 内存上限 (GiB)。对下一个任务即生效, 无需重启。"""
+    from app.services import preferences
+    return {
+        "backtest_worker_rss_limit_gib": preferences.set_backtest_worker_rss_limit_gib(req.gib)
+    }
 
 
 # ── 五档盘口 sealed 配置 ──────────────────────────────
