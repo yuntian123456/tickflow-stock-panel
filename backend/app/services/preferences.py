@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import re
@@ -34,6 +35,23 @@ def _invalidate_cache() -> None:
     global _cache, _cache_sig
     _cache = None
     _cache_sig = None
+
+
+def data_source_stamp() -> tuple:
+    """Opaque config version; routine last-fetch persistence must not invalidate pulls."""
+    from app.config import settings
+
+    data = load()
+    data.pop("last_fetch_ms", None)
+    result = [hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()]
+    for name in ("secrets.json",):
+        path = settings.data_dir / "user_data" / name
+        try:
+            stat = path.stat()
+            result.append((stat.st_mtime_ns, stat.st_size))
+        except FileNotFoundError:
+            result.append(None)
+    return (str(settings.data_dir.resolve()), *result)
 
 
 def load() -> dict:
@@ -1296,6 +1314,36 @@ def get_nav_order() -> list[str]:
     return load().get("nav_order", [])
 
 
+def get_nav_layout() -> dict | None:
+    from app.services.nav_layout import validate_nav_layout
+
+    raw = load().get("nav_layout")
+    if raw is None:
+        return None
+    try:
+        return validate_nav_layout(raw)
+    except ValueError:
+        return None
+
+
+def set_nav_layout(value: dict | None, hidden: list[str] | None = None) -> dict | None:
+    from app.services.nav_layout import flat_nav_order, validate_nav_layout
+
+    cleaned = validate_nav_layout(value) if value is not None else None
+    with mutation():
+        raw = load().get("nav_layout")
+        if isinstance(raw, dict) and raw.get("v", 1) != 1:
+            raise ValueError("导航布局由更高版本创建，请升级后再修改")
+        updates: dict = {"nav_layout": cleaned}
+        if cleaned is not None:
+            # 平铺副本供旧版本回退，归属和顺序始终在同一次原子写入中更新。
+            updates["nav_order"] = flat_nav_order(cleaned)
+        if hidden is not None:
+            updates["nav_hidden"] = list(dict.fromkeys(x for x in hidden if x != "/"))
+        save(updates)
+    return cleaned
+
+
 def set_nav_order(order: list[str]) -> list[str]:
     """保存左侧菜单排序。"""
     save({"nav_order": order})
@@ -1444,6 +1492,7 @@ _UI_PREFS_KEYS = (
     "settings_nav_collapsed",
     "bt_strategy_list_maxh",
     "nav_state",
+    "nav_groups",
     # AI 助手悬浮球显隐 (assistant.fab.enabled 的后端副本) — 同样受端口漂移影响
     "assistant_fab_enabled",
     # JSON 文本沿用标量契约，保存统一策略池的 ID 顺序与显式空选择。

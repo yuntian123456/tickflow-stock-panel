@@ -1,10 +1,15 @@
 import { useEffect, useState } from 'react'
 import { motion } from 'framer-motion'
+import { useQueryClient } from '@tanstack/react-query'
 import { Loader2, Search, Check, Clock, Zap, Settings2, AlertCircle, CheckCircle2, Calendar, History, Layers, X, Database } from 'lucide-react'
 import { api, type ExtDataBackfillResult, type ExtDataConfig, type ExtPullAuth } from '@/lib/api'
 import { toast } from '@/components/Toast'
 import { useDialogBackdrop } from '@/lib/useDialogBackdrop'
-import { SectionHead, INPUT_CLS } from './dialogShared'
+import { invalidateExtDataQueries } from '@/lib/ext-data-cache'
+import {
+  SectionHead, INPUT_CLS, formatIntervalSummary,
+  MIN_PULL_INTERVAL_SECONDS, MAX_PULL_INTERVAL_SECONDS, validatePullInterval,
+} from './dialogShared'
 
 const AUTH_TYPE_LABELS: Record<ExtPullAuth['type'], string> = {
   none: '无',
@@ -35,6 +40,7 @@ export function ExtDataPullPanel({ config, onSaved }: {
   config: ExtDataConfig
   onSaved: () => void
 }) {
+  const queryClient = useQueryClient()
   const pull = config.pull
   const [showConfig, setShowConfig] = useState(false)
   const [toggling, setToggling] = useState(false)
@@ -42,6 +48,10 @@ export function ExtDataPullPanel({ config, onSaved }: {
   const [running, setRunning] = useState(false)
   const [runResult, setRunResult] = useState<{ rows: number; date: string } | null>(null)
   const [error, setError] = useState('')
+  const handleSaved = () => {
+    onSaved()
+    void invalidateExtDataQueries(queryClient)
+  }
 
   const enabled = optimistic ?? (pull?.enabled ?? false)
 
@@ -57,7 +67,7 @@ export function ExtDataPullPanel({ config, onSaved }: {
         : pull.schedule_period === 'monthly' ? `每月 ${pull.schedule_day ?? 1} 号`
           : '每天'
     } ${pull.schedule_time}${pull.schedule_trading_only ? ' · 仅交易日' : ''}`
-    : `每 ${pull?.schedule_minutes ?? 1440} 分钟`
+    : formatIntervalSummary(pull?.schedule_seconds, pull?.schedule_minutes)
 
   // 从已保存配置原样重建 payload 仅切换 enabled — 不掺入设置弹窗里未保存的草稿;
   // page_start / fanout / auth.key_ref 等 UI 不暴露的字段透传保留
@@ -72,6 +82,7 @@ export function ExtDataPullPanel({ config, onSaved }: {
       field_map: pull.field_map,
       auth: pull.auth ?? undefined,
       schedule_minutes: pull.schedule_minutes,
+      schedule_seconds: pull.schedule_seconds ?? null,
       enabled: next,
       schedule_time: pull.schedule_time ?? null,
       schedule_period: pull.schedule_period ?? null,
@@ -106,7 +117,7 @@ export function ExtDataPullPanel({ config, onSaved }: {
     setToggling(true); setError(''); setOptimistic(next)
     api.extDataPullConfig(config.id, payload)
       .then(() => {
-        onSaved()
+        handleSaved()
         toast(next ? '定时拉取已启用 · 立即执行首次拉取' : '定时拉取已关闭', 'success')
       })
       .catch(e => setError(e.message || '切换失败'))
@@ -118,7 +129,7 @@ export function ExtDataPullPanel({ config, onSaved }: {
     api.extDataPullRun(config.id, effTimeoutSec)
       .then(r => {
         setRunResult({ rows: r.rows, date: r.date })
-        onSaved()
+        handleSaved()
         toast(`拉取成功 · ${r.rows} 行`, 'success')
       })
       .catch(e => setError(e.message || '执行失败'))
@@ -229,7 +240,7 @@ export function ExtDataPullPanel({ config, onSaved }: {
       {showConfig && (
         <ExtPullConfigDialog
           config={config}
-          onSaved={onSaved}
+          onSaved={handleSaved}
           onClose={() => setShowConfig(false)}
         />
       )}
@@ -256,7 +267,11 @@ function ExtPullConfigDialog({ config, onSaved, onClose }: {
   const [fieldMapStr, setFieldMapStr] = useState(
     pull?.field_map ? JSON.stringify(pull.field_map, null, 2) : ''
   )
-  const [schedule, setSchedule] = useState(pull?.schedule_minutes ?? 1440)
+  // 间隔: 已配置秒级 (schedule_seconds) 时以秒初始化, 否则分钟; 单位可切换
+  const [scheduleUnit, setScheduleUnit] = useState<'seconds' | 'minutes'>(
+    pull?.schedule_seconds ? 'seconds' : 'minutes'
+  )
+  const [schedule, setSchedule] = useState(pull?.schedule_seconds ?? pull?.schedule_minutes ?? 1440)
   // 调度二选一 (UI 态): 间隔制 / 固定时刻制。旧版「填了时刻就把间隔框禁用」
   // 的隐式联动发现性差, 改为显式切换; 切回间隔制时清空固定时刻
   const [scheduleMode, setScheduleMode] = useState<'interval' | 'fixed'>(pull?.schedule_time ? 'fixed' : 'interval')
@@ -323,6 +338,11 @@ function ExtPullConfigDialog({ config, onSaved, onClose }: {
       setError('固定时刻模式请先选择时刻（或切回「按间隔」）')
       return null
     }
+    const intervalError = validatePullInterval(schedule, scheduleUnit)
+    if (intervalError) {
+      setError(intervalError)
+      return null
+    }
     const headers = parseJson(headerStr, 'Headers')
     if (headers === null) return null
     const field_map = parseJson(fieldMapStr, '字段映射')
@@ -334,10 +354,14 @@ function ExtPullConfigDialog({ config, onSaved, onClose }: {
       // UI 不暴露 key_ref (复用其他插件的凭据): 保留已有值, 避免普通保存把它抹掉
       ...(pull?.auth?.key_ref ? { key_ref: pull.auth.key_ref } : {}),
     }
+    // 双写分钟值，版本回滚到旧版时仍能读到最接近的频率。
+    const effSeconds = scheduleUnit === 'seconds' ? schedule : null
     return {
       url, method, headers, body: body || undefined,
       response_path: responsePath, field_map, auth,
-      schedule_minutes: schedule, enabled: enabledOverride ?? enabled,
+      schedule_minutes: effSeconds != null ? Math.ceil(effSeconds / 60) : schedule,
+      schedule_seconds: effSeconds,
+      enabled: enabledOverride ?? enabled,
       schedule_time: scheduleMode === 'fixed' ? scheduleTime : null,
       schedule_period: scheduleMode === 'fixed' ? schedulePeriod : null,
       schedule_day: scheduleMode === 'fixed' && schedulePeriod !== 'daily' ? scheduleDay : null,
@@ -453,7 +477,10 @@ function ExtPullConfigDialog({ config, onSaved, onClose }: {
         : schedulePeriod === 'monthly' ? `每月 ${scheduleDay} 号`
           : '每天'
     } ${scheduleTime}${scheduleTradingOnly ? ' · 仅交易日' : ''}`
-    : `每 ${schedule} 分钟`
+    : formatIntervalSummary(
+        scheduleUnit === 'seconds' ? schedule : null,
+        schedule,
+      )
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
@@ -630,12 +657,32 @@ function ExtPullConfigDialog({ config, onSaved, onClose }: {
                 <div className="space-y-3">
                   <div className="grid grid-cols-3 gap-2">
                     <div>
-                      <div className="text-[10px] text-muted mb-1">间隔（分钟）</div>
-                      <input
-                        type="number" min={1} value={schedule} onChange={e => setSchedule(Number(e.target.value))}
-                        title="每隔 N 分钟拉取一次 (从启用时刻起算)"
-                        className="w-full h-8 px-2.5 rounded-lg border border-border bg-base text-[11px] font-mono tabular-nums text-foreground focus:outline-none focus:ring-1 focus:ring-accent/25"
-                      />
+                      <div className="text-[10px] text-muted mb-1">间隔</div>
+                      <div className="flex gap-1">
+                        <input
+                          type="number" min={scheduleUnit === 'seconds' ? MIN_PULL_INTERVAL_SECONDS : 1}
+                          max={scheduleUnit === 'seconds' ? MAX_PULL_INTERVAL_SECONDS : undefined}
+                          step={1} value={schedule}
+                          onChange={e => setSchedule(Number(e.target.value))}
+                          title="每隔 N 秒/分钟拉取一次 (从启用时刻起算); 秒级适合盘中快照, 对公网接口请谨慎调低"
+                          className="w-full min-w-0 h-8 px-2.5 rounded-lg border border-border bg-base text-[11px] font-mono tabular-nums text-foreground focus:outline-none focus:ring-1 focus:ring-accent/25"
+                        />
+                        <select
+                          value={scheduleUnit}
+                          onChange={e => {
+                            const unit = e.target.value as 'seconds' | 'minutes'
+                            if (unit === scheduleUnit) return
+                            // 数值跟随换算 (5 分钟 ↔ 300 秒), 避免切单位后语义突变
+                            setSchedule(unit === 'seconds' ? schedule * 60 : Math.ceil(schedule / 60))
+                            setScheduleUnit(unit)
+                          }}
+                          title={`间隔单位: 秒 (${MIN_PULL_INTERVAL_SECONDS}~${MAX_PULL_INTERVAL_SECONDS}) / 分钟 (1~)`}
+                          className="h-8 shrink-0 rounded-lg border border-border bg-base px-1.5 text-[11px] text-foreground cursor-pointer focus:outline-none focus:ring-1 focus:ring-accent/25"
+                        >
+                          <option value="minutes">分钟</option>
+                          <option value="seconds">秒</option>
+                        </select>
+                      </div>
                     </div>
                     <div>
                       <div className="text-[10px] text-muted mb-1">窗口起（留空=不限）</div>
@@ -655,7 +702,7 @@ function ExtPullConfigDialog({ config, onSaved, onClose }: {
                     </div>
                   </div>
                   <div className="text-[10px] text-muted/70 leading-relaxed">
-                    间隔制锁相在启用时刻 — 「每天 09:30」这类日程请用固定时刻。
+                    间隔制锁相在启用时刻 — 「每天 09:30」这类日程请用固定时刻。秒级间隔（≥10s）适合盘中快照，对公网接口请谨慎调低。
                   </div>
                 </div>
               ) : (
@@ -817,11 +864,11 @@ function ExtPullConfigDialog({ config, onSaved, onClose }: {
               </div>
               <div>
                 <div className="text-[11px] font-medium text-secondary mb-1.5">
-                  序列粒度
-                  <span className="ml-1.5 text-[10px] font-normal text-muted">决定列表迷你图口径: 当日逐盘 / 近N日每日一值</span>
+                  默认显示周期
+                  <span className="ml-1.5 text-[10px] font-normal text-muted">列表中每一列还可单独选择</span>
                 </div>
                 <select
-                  aria-label="序列粒度"
+                  aria-label="默认显示周期"
                   value={granularity} onChange={e => setGranularity(e.target.value as 'auto' | 'intraday' | 'daily')}
                   title="列表迷你图列与序列接口按此口径取数; 自动判断依据时间列数据形态"
                   className="h-9 w-full rounded-lg border border-border bg-base px-3 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-accent/25 focus:border-accent/50"
@@ -831,9 +878,10 @@ function ExtPullConfigDialog({ config, onSaved, onClose }: {
                       ? `（当前: ${config.granularity_effective === 'intraday' ? '日内多盘' : '日级别'}${config.granularity_effective === 'intraday' && config.plate ? ` · ${config.plate.plates} 盘` : ''}）`
                       : '（暂无数据）'}`}
                   </option>
-                  <option value="intraday">日内多盘（当日逐盘序列）</option>
-                  <option value="daily">日级别（近 N 日每日一值）</option>
+                  <option value="intraday" disabled={!timeField.trim()}>按日内（当天全部盘次）</option>
+                  <option value="daily">按日（近 N 日，每天一值）</option>
                 </select>
+                <p className="mt-1 text-[10px] text-muted/70">显示周期不改变原始记录；按日展示时，同一天取最后一个有效值。</p>
                 {granularity === 'auto' && (
                   <div className="mt-1 text-[10px] text-muted/70">
                     按时间列数据形态判断: 存在非零时刻 → 日内多盘; 日期形态 / 00:00:00 / 未配时间字段 → 日级别
@@ -1012,7 +1060,7 @@ function ExtPullConfigDialog({ config, onSaved, onClose }: {
           )}
 
           {error && (
-            <div className="flex items-start gap-2 text-[11px] text-danger bg-danger/5 border border-danger/20 rounded-lg px-3 py-2.5">
+            <div role="alert" className="flex items-start gap-2 text-[11px] text-danger bg-danger/5 border border-danger/20 rounded-lg px-3 py-2.5">
               <AlertCircle className="h-3.5 w-3.5 mt-px shrink-0" />
               <span className="leading-relaxed">{error}</span>
             </div>

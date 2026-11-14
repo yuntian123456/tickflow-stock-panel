@@ -4,6 +4,7 @@
 // Prod:同源(FastAPI 托管前端 dist)
 
 import { toast } from '@/components/Toast'
+import type { NavLayout } from './navLayout'
 
 const BASE = ''
 
@@ -26,6 +27,12 @@ export class ApiError extends Error {
     this.status = status
     this.retryAfterMs = retryAfterMs
   }
+}
+
+export interface WatchlistPrepareResult {
+  symbol: string
+  status: 'ready' | 'no_data' | 'unsupported' | 'failed' | 'busy'
+  message: string
 }
 
 /**
@@ -262,6 +269,7 @@ export interface MinuteKlineRow {
 
 export interface MinuteKlineSession {
   date: string
+  partial?: boolean
   prev_close: number | null
   rows: MinuteKlineRow[]
 }
@@ -295,6 +303,11 @@ export interface KlineRow {
   low: number
   close: number
   volume?: number
+  /** 图表异动判定使用未复权价格与引擎的当日判定价，不与复权 OHLC 混用。 */
+  raw_low?: number | null
+  raw_close?: number | null
+  limit_down_price?: number | null
+  signal_limit_down_recovery?: boolean | null
   change_pct?: number
   ma5?: number | null
   ma20?: number | null
@@ -307,18 +320,31 @@ export interface KlineRow {
   [key: string]: any
 }
 
+export interface QuoteFreshness {
+  state: 'live' | 'delayed' | 'stale' | 'historical' | 'unknown' | 'missing' | 'paused' | 'disabled'
+  message: string
+  data_date: string | null
+  quote_ts: number | null
+  checked_at: number
+  max_age_ms: number
+}
+
 export interface KlineDailyResponse {
   symbol: string
+  asset_type?: 'stock' | 'etf' | 'index'
   name?: string
   stock_info?: { name?: string; total_shares?: number; float_shares?: number; ext?: Record<string, unknown> }
   rows: KlineRow[]
   source?: string
+  quote_freshness?: QuoteFreshness | null
 }
 
 export interface KlineDailyLatestResponse {
   symbol: string
+  asset_type?: 'stock' | 'etf' | 'index'
   row: KlineRow | null
   source: 'live' | 'none'
+  quote_freshness?: QuoteFreshness | null
 }
 
 // ===== Watchlist =====
@@ -409,6 +435,7 @@ export interface ScreenerStrategy {
   source?: string
   /** 支持的周期, 如 ['1d'] / ['1m'] (分钟策略) */
   timeframes?: string[]
+  library?: StrategyLibraryInfo | null
 }
 
 export interface StrategyLoadError {
@@ -884,6 +911,7 @@ export interface StrategyDetail {
   tags: string[]
   source: 'custom' | 'ai' | 'composite'
   research_only?: boolean
+  library?: StrategyLibraryInfo | null
   execution_backend: 'polars_expr' | 'matrix_native' | 'python_history_legacy' | 'composite' | 'minute_filter'
   asset_types: string[]
   timeframes: string[]
@@ -914,6 +942,37 @@ export interface StrategyDetail {
 
 export type ScoringDirection = 'high' | 'low'
 
+// ===== Strategy Pool v2 (池成员 + 策略库分组/归档) =====
+
+export interface StrategyPoolGroup {
+  id: string
+  name: string
+}
+
+/** 策略库元数据 — 库级属性, 与是否在池中无关 */
+export interface StrategyLibraryMeta {
+  /** 自定义分组; null = 未分组 (「自定义/AI/叠加」是来源分类, 不在此) */
+  group: string | null
+  /** 已归档 (可逆): 策略库与选择器隐藏, 同时移出池 */
+  archived: boolean
+  archived_at: string | null
+  /** 加入时间 (策略保存/首次被引擎看到时登记; 排序依据) */
+  added_at: string | null
+}
+
+export interface StrategyLibraryInfo extends StrategyLibraryMeta {
+  group_name: string | null
+}
+
+export interface StrategyPoolSnapshot {
+  /** 旧服务/测试快照允许缺失; 新服务用它丢弃晚到的旧响应。 */
+  revision?: number
+  groups: StrategyPoolGroup[]
+  /** 参与扫描的策略 ID 有序列表 (纯顺序, 不带属性) */
+  pool: string[]
+  meta: Record<string, StrategyLibraryMeta>
+}
+
 export interface StrategyBuildResult {
   code: string
   meta: Record<string, any>
@@ -941,6 +1000,7 @@ export interface StrategyCodeSaveResult {
 export interface AiIterateRound {
   round: number
   stats: Record<string, number> | null
+  backtest_error?: string | null
   change_summary: string
 }
 
@@ -970,6 +1030,11 @@ export interface CustomSignal {
   min_bars?: number
   /** 显式输出列名 (缺省 csg_{id}); 迁移自内置的定义沿用 signal_* 原列名, 编辑保存须原样回传 */
   column?: string
+  /** 已归档 (可逆): 信号库/选择器隐藏, 但仍照常编译注入, 引用它的策略不受影响 */
+  archived?: boolean
+  archived_at?: string | null
+  /** 创建时间 (旧定义可能缺失 → undefined, 排序时回退名称) */
+  created_at?: string | null
 }
 
 export interface CustomSignalFieldGroup {
@@ -1449,6 +1514,7 @@ export interface FactorColumn {
   label: string
   group: string
   desc: string
+  archived?: boolean
 }
 
 // ===== Factor Library (注册表, P1) =====
@@ -1470,6 +1536,8 @@ export interface FactorLibraryItem {
   stability: FactorStability
   /** 完整生命周期状态; 内置因子无盘上定义 → null (stability 是它的二元投影) */
   status: 'draft' | 'active' | 'watch' | 'retired' | null
+  /** 已归档 (可逆): 不再出现在因子库/选择器, 但注册表照常计算, 引用方不受影响 */
+  archived: boolean
   scale_free: boolean
   dependencies: string[]
 }
@@ -2328,6 +2396,8 @@ export interface DefinitionsCatalogItem {
   id: string
   label: string
   enabled?: boolean
+  /** 已归档 (可逆): 选择器默认隐藏, 正被引用的仍显示 */
+  archived?: boolean
   timeframe?: string
   lang: string
   status?: string
@@ -2454,6 +2524,8 @@ export interface Preferences {
   webhook_default_channels?: string[]
   nav_order: string[]
   nav_hidden: string[]
+  nav_layout?: NavLayout | null
+  ui_prefs?: Record<string, string | number | boolean>
   /** 看板自定义布局; null/缺省 = 未自定义(前端内置默认布局) */
   dashboard_layout: { v: number; items: Array<{ i: string; t: string; x: number; y: number; w: number; h: number; p?: Record<string, string> }> } | null
   screener_auto_run: boolean
@@ -2783,15 +2855,28 @@ export const api = {
     request<{ ok: boolean }>('/api/settings/ai', { method: 'DELETE' }),
 
   /** 草稿连通性测试 — 只验证当前表单值, 不保存任何配置 */
-  testAiSettings: (
+  testAiSettings: async (
     ai: { provider?: string; base_url?: string; api_key?: string; model?: string; protocol?: string },
     opts?: { timeoutMs?: number },
-  ) =>
-    request<{ ok: boolean; model?: string; response?: string; error?: string; error_type?: string }>('/api/settings/ai/test', {
-      method: 'POST',
-      body: JSON.stringify(ai),
-      ...(opts?.timeoutMs != null ? { timeoutMs: opts.timeoutMs } : {}),
-    }),
+  ) => {
+    const invalidResponse = 'AI 连接测试未收到有效的后端响应。请确认前后端版本一致，重启 TSP 后刷新页面，并检查代理是否将 /api 请求转发到 TSP 后端。'
+    try {
+      const result = await request<{ ok: boolean; model?: string; response?: string; error?: string; error_type?: string }>('/api/settings/ai/test', {
+        method: 'POST',
+        body: JSON.stringify(ai),
+        quiet: true,
+        ...(opts?.timeoutMs != null ? { timeoutMs: opts.timeoutMs } : {}),
+      })
+      if (typeof result?.ok !== 'boolean') throw new ApiError(invalidResponse, 502)
+      return result
+    } catch (error) {
+      if (error instanceof ApiError && (error.status === 404 || error.status === 405)) {
+        throw new ApiError(`AI 连接测试接口不可用（HTTP ${error.status}）。请确认前后端版本一致，完整升级并重启 TSP 后刷新页面。使用代理时，请确认 POST /api/settings/ai/test 转发到 TSP 后端。`, error.status)
+      }
+      if (error instanceof SyntaxError) throw new ApiError(invalidResponse, 502)
+      throw error
+    }
+  },
 
   upgradeGuardStatus: () => request<UpgradeGuardStatus>('/api/upgrade-guard/status'),
   upgradeGuardScan: () => request<UpgradeGuardStatus>('/api/upgrade-guard/scan', { method: 'POST' }),
@@ -3068,6 +3153,14 @@ export const api = {
       { method: 'PUT', body: JSON.stringify({ interval }) },
     ),
   intradayRefresh: () => request<{ status: string }>('/api/intraday/refresh', { method: 'POST' }),
+  subscribeQuotes: (clientId: string, symbols: string[]) =>
+    request<{ lease_seconds: number }>(`/api/intraday/subscriptions/${encodeURIComponent(clientId)}`, {
+      method: 'PUT', body: JSON.stringify({ symbols }), quiet: true, timeoutMs: 10_000,
+    }),
+  unsubscribeQuotes: (clientId: string) =>
+    request<{ status: string }>(`/api/intraday/subscriptions/${encodeURIComponent(clientId)}`, {
+      method: 'DELETE', quiet: true, keepalive: true, timeoutMs: 10_000,
+    }),
   indexQuotes: (symbols?: string[]) =>
     request<{ rows: IndexQuote[]; count: number }>(
       `/api/intraday/indices${symbols?.length ? `?symbols=${encodeURIComponent(symbols.join(','))}` : ''}`,
@@ -3207,6 +3300,10 @@ export const api = {
     request<{ nav_order: string[] }>('/api/settings/preferences/nav-order', {
       method: 'PUT',
       body: JSON.stringify({ nav_order }),
+    }),
+  saveNavLayout: (nav_layout: NavLayout | null, nav_hidden: string[]) =>
+    request<{ nav_layout: NavLayout | null; nav_order: string[]; nav_hidden: string[] }>('/api/settings/preferences/nav-layout', {
+      method: 'PUT', body: JSON.stringify({ nav_layout, nav_hidden }),
     }),
   saveNavHidden: (nav_hidden: string[]) =>
     request<{ nav_hidden: string[] }>('/api/settings/preferences/nav-hidden', {
@@ -3398,10 +3495,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ symbol, ...(days != null ? { days } : {}) }),
     }),
-  repairMinuteGaps: (symbols: string[]) =>
+  repairMinuteGaps: (targets: Pick<MinuteGapRow, 'symbol' | 'date'>[] | string[]) =>
     request<{ status: string; job_id: string }>('/api/kline/repair_minute_gaps', {
       method: 'POST',
-      body: JSON.stringify({ symbols }),
+      body: JSON.stringify(typeof targets[0] === 'string' ? { symbols: targets } : { targets }),
     }),
   clearMinute: () =>
     request<{ status: string; removed: number }>('/api/kline/clear_minute', {
@@ -3471,6 +3568,11 @@ export const api = {
       `/api/watchlist/${encodeURIComponent(symbol)}/group`,
       { method: 'PUT', body: JSON.stringify({ group_id: groupId }) },
     ),
+  watchlistGroupTransfer: (source: string, target: string, symbols: string[], action: 'move' | 'copy') =>
+    request<{ symbols: WatchlistEntry[]; changed: number }>(
+      `/api/watchlist/groups/${encodeURIComponent(source)}/transfer`,
+      { method: 'POST', body: JSON.stringify({ target_group_id: target, symbols, action }), quiet: true },
+    ),
   watchlistGroupAddMember: (groupId: string, symbol: string) =>
     request<{ symbols: WatchlistEntry[] }>(
       `/api/watchlist/groups/${encodeURIComponent(groupId)}/members/${encodeURIComponent(symbol)}`,
@@ -3534,6 +3636,11 @@ export const api = {
         ? `/api/watchlist/enriched?ext_columns=${encodeURIComponent(extColumns)}`
         : '/api/watchlist/enriched',
     ),
+  watchlistPrepare: (symbols: string[]) => request<{ results: WatchlistPrepareResult[] }>(
+    '/api/watchlist/prepare',
+    { method: 'POST', body: JSON.stringify({ symbols }), timeoutMs: COMPUTE_REQUEST_TIMEOUT_MS, quiet: true },
+  ),
+  dataVersions: () => request<{ versions: Record<string, string> }>('/api/intraday/data-versions', { quiet: true }),
 
   // timeframe='all' 时不传参数 → 后端不过滤周期, 返回日线+分钟合并列表
   screenerStrategies: async (assetType?: 'stock' | 'etf' | 'index', timeframe: '1d' | '1m' | 'all' = '1d') => {
@@ -3744,6 +3851,13 @@ export const api = {
     request<{ ok: boolean; id: string; group: string }>(
       `/api/factors/custom/${encodeURIComponent(factorId)}/group`,
       { method: 'POST', body: JSON.stringify({ group }) },
+    ),
+
+  /** 归档/恢复因子 (可逆): 只改标记位, 不注销注册表 */
+  factorArchive: (factorId: string, archived: boolean) =>
+    request<{ ok: boolean; id: string; archived: boolean }>(
+      `/api/factors/custom/${encodeURIComponent(factorId)}/${archived ? 'archive' : 'unarchive'}`,
+      { method: 'POST' },
     ),
 
   factorRun: (payload: {
@@ -4250,19 +4364,22 @@ export const api = {
   extDataSchemaAll: () =>
     request<{ items: { id: string; label: string; mode: string; time_field?: string | null; granularity?: 'intraday' | 'daily' | null; columns: { name: string; type: string; label: string }[] }[] }>('/api/ext-data/schema-all'),
 
-  /** 日内多盘序列 (列表迷你图列): 每标的一天的 [HH:MM:SS, value] 点列 */
-  extDataSeries: (configId: string, field: string, date?: string | null, symbols?: string[], days?: number) =>
+  /** 列表扩展序列: 按日 / 按日内读取, 不指定显示周期时跟随数据表。 */
+  extDataSeries: (configId: string, field: string, date?: string | null, symbols?: string[], days?: number, granularity?: 'daily' | 'intraday') =>
     request<{ config_id: string; field: string; date: string | null; granularity?: 'intraday' | 'daily'; days?: number; items: Record<string, [string, number][]> }>(
       `/api/ext-data/${configId}/series?field=${encodeURIComponent(field)}`
         + (date ? `&date=${date}` : '')
         + (symbols?.length ? `&symbols=${encodeURIComponent(symbols.join(','))}` : '')
-        + (days ? `&days=${days}` : ''),
+        + (days ? `&days=${days}` : '')
+        + (granularity ? `&granularity=${granularity}` : ''),
     ),
 
   extDataPullConfig: (id: string, body: {
     url: string; method?: string; headers?: Record<string, string>; body?: string;
     response_path?: string; field_map?: Record<string, string>;
     schedule_minutes?: number; enabled?: boolean;
+    /** 间隔秒数 (10~2592000): 配置后优先于 schedule_minutes; null=沿用分钟值 */
+    schedule_seconds?: number | null;
     schedule_time?: string | null;
     schedule_period?: 'daily' | 'weekly' | 'monthly' | null;
     schedule_day?: number | null;
@@ -4749,6 +4866,64 @@ export const api = {
   strategyReload: () =>
     request<{ ok: boolean; count: number }>('/api/strategies/reload', { method: 'POST' }),
 
+  // ===== Strategy Pool v2 (池成员 / 策略库分组与归档) =====
+  strategyPoolSnapshot: (signal?: AbortSignal) =>
+    request<StrategyPoolSnapshot>('/api/strategy-pool', { signal }),
+
+  /** 池的整体替换 (纯 ID 顺序; 已归档策略会被后端拒绝) */
+  strategyPoolSetEntries: (ids: string[], onlyIfEmpty = false, expectedRevision?: number) =>
+    request<StrategyPoolSnapshot>('/api/strategy-pool/entries', {
+      method: 'PUT',
+      body: JSON.stringify({ pool: ids, only_if_empty: onlyIfEmpty, expected_revision: expectedRevision }),
+    }),
+
+  strategyPoolAdd: (strategyId: string) =>
+    request<StrategyPoolSnapshot>(`/api/strategy-pool/entries/${encodeURIComponent(strategyId)}`, { method: 'POST' }),
+
+  strategyPoolRemove: (strategyId: string) =>
+    request<StrategyPoolSnapshot>(`/api/strategy-pool/entries/${encodeURIComponent(strategyId)}`, { method: 'DELETE' }),
+
+  /** 归档策略 (库级, 可逆): 移入档案库并移出池; 不删除策略文件 */
+  strategyPoolArchiveStrategy: (strategyId: string) =>
+    request<StrategyPoolSnapshot>(`/api/strategy-pool/strategies/${encodeURIComponent(strategyId)}/archive`, { method: 'POST' }),
+
+  /** 恢复策略: 回到策略库 (不自动回池) */
+  strategyPoolUnarchiveStrategy: (strategyId: string) =>
+    request<StrategyPoolSnapshot>(`/api/strategy-pool/strategies/${encodeURIComponent(strategyId)}/unarchive`, { method: 'POST' }),
+
+  /** 删除策略的库级记录 (清理档案库中已删除的策略) */
+  strategyPoolDiscardRecord: (strategyId: string) =>
+    request<StrategyPoolSnapshot>(`/api/strategy-pool/strategies/${encodeURIComponent(strategyId)}/record`, { method: 'DELETE' }),
+
+  /** 设置策略的自定义分组 (null = 未分组) */
+  strategyPoolSetStrategyGroup: (strategyId: string, group: string | null) =>
+    request<StrategyPoolSnapshot>(`/api/strategy-pool/strategies/${encodeURIComponent(strategyId)}/group`, {
+      method: 'POST',
+      body: JSON.stringify({ group }),
+    }),
+
+  strategyPoolCreateGroup: (name: string) =>
+    request<StrategyPoolSnapshot & { group: StrategyPoolGroup }>('/api/strategy-pool/groups', {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    }),
+
+  strategyPoolRenameGroup: (groupId: string, name: string) =>
+    request<StrategyPoolSnapshot>(`/api/strategy-pool/groups/${encodeURIComponent(groupId)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ name }),
+    }),
+
+  strategyPoolReorderGroups: (orderedIds: string[]) =>
+    request<StrategyPoolSnapshot>('/api/strategy-pool/groups/reorder', {
+      method: 'PUT',
+      body: JSON.stringify({ ordered_ids: orderedIds }),
+    }),
+
+  /** 删除分组定义; 组内策略保留转未分组 */
+  strategyPoolDeleteGroup: (groupId: string) =>
+    request<StrategyPoolSnapshot>(`/api/strategy-pool/groups/${encodeURIComponent(groupId)}`, { method: 'DELETE' }),
+
   // ===== Custom Signals (自定义信号) =====
   customSignalsList: () =>
     request<{ signals: CustomSignal[] }>('/api/custom-signals'),
@@ -4764,6 +4939,10 @@ export const api = {
 
   customSignalDelete: (id: string) =>
     request<{ ok: boolean }>(`/api/custom-signals/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
+  /** 归档/恢复信号 (可逆): 只改标记位, 不影响编译注入 */
+  customSignalArchive: (id: string, archived: boolean) =>
+    request<{ ok: boolean; signal: CustomSignal }>(`/api/custom-signals/${encodeURIComponent(id)}/${archived ? 'archive' : 'unarchive'}`, { method: 'POST' }),
 
   customSignalsAiGenerate: (description: string) =>
     request<CustomSignalAIGenerateResult>('/api/custom-signals/ai/generate', {
@@ -4946,7 +5125,7 @@ export const api = {
 
   /** 检查 AI 配置状态 */
   strategyAiStatus: () =>
-    request<{ configured: boolean; has_key: boolean; has_model: boolean; provider?: string }>('/api/strategies/ai/status'),
+    request<{ configured: boolean; has_key: boolean; has_model: boolean; provider?: string; supports_tools?: boolean }>('/api/strategies/ai/status'),
 
   /** 测试 AI 连通性 */
   strategyAiTest: () =>
@@ -5078,6 +5257,8 @@ export interface PipelineJob {
     enriched_days?: number
     index_count?: number
     index_daily_rows?: number
+    requested_gaps?: number
+    remaining_gaps?: number
     minute_rows?: number
     skipped_stages?: string[]
   } | null
@@ -5221,6 +5402,8 @@ export interface PullConfig {
   response_path: string
   field_map?: Record<string, string>
   schedule_minutes: number
+  /** 间隔秒数 (10~2592000): 配置后优先于 schedule_minutes 生效; null/缺省=分钟制 */
+  schedule_seconds?: number | null
   enabled: boolean
   /** 每日固定拉取时刻 "HH:MM" (北京时间): 配置后忽略间隔, 每天该时刻拉一次; null=间隔制 */
   schedule_time?: string | null
